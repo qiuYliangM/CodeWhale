@@ -7239,6 +7239,73 @@ fn refresh_system_prompt_is_noop_when_unchanged() {
     assert_eq!(engine.session.system_prompt, first_prompt);
 }
 
+/// [pinvou3-fork] 会话能力档案热更:`Op::SetDisabledSkills` 更新引擎内会话集后,
+/// 下一轮 `refresh_system_prompt`(turn loop 每轮调用)的 `## Skills` catalogue
+/// 必须反映新集合——会话集禁用的 skill 先隐藏,热更为空集后重新列出。
+/// 回归:Op handler 不写 `config.disabled_skills`,或两个 prompt 构建点不透传会话集。
+#[test]
+fn forkguard_set_disabled_skills_hot_update_renders_new_catalogue() {
+    let tmp = tempdir().expect("tempdir");
+    let skills_dir = tmp.path().join("skills");
+    for n in ["fg-engine-kept", "fg-engine-victim"] {
+        let dir = skills_dir.join(n);
+        fs::create_dir_all(&dir).expect("mkdir");
+        fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {n}\ndescription: probe\n---\nbody"),
+        )
+        .expect("write");
+    }
+
+    let config = EngineConfig {
+        workspace: tmp.path().to_path_buf(),
+        skills_dir,
+        skills_scan_codewhale_only: true,
+        disabled_skills: Some(vec!["fg-engine-victim".to_string()]),
+        ..Default::default()
+    };
+    let (mut engine, _handle) = Engine::new(config, &Config::default());
+
+    let prompt_text = |engine: &Engine| match engine.session.system_prompt.as_ref() {
+        Some(SystemPrompt::Text(text)) => text.clone(),
+        Some(SystemPrompt::Blocks(blocks)) => blocks
+            .iter()
+            .map(|block| block.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+        None => panic!("expected system prompt"),
+    };
+
+    // 构建期(Engine::new 的 prompt 构建点):会话集禁用的 skill 不进 catalogue。
+    // 断言锁定 catalogue 行格式(`- <name>:`)——workspace 概览会把 skills 目录的
+    // 文件树印进 prompt,裸 substring 会误判。
+    let initial = prompt_text(&engine);
+    assert!(
+        initial.contains("- fg-engine-kept:"),
+        "session-enabled skill must be listed in the catalogue: {initial}"
+    );
+    assert!(
+        !initial.contains("- fg-engine-victim:"),
+        "session-disabled skill must be hidden from the catalogue: {initial}"
+    );
+
+    // Op::SetDisabledSkills(vec![]) 的 handler 语义:Some(空集) = 有档案且全部
+    // 启用(不能塌缩成 None——None 会回落进程级全局)。turn loop 每轮
+    // refresh_system_prompt 让新集合生效。
+    engine.config.disabled_skills = Some(Vec::new());
+    engine.refresh_system_prompt();
+
+    let updated = prompt_text(&engine);
+    assert!(
+        updated.contains("- fg-engine-victim:"),
+        "hot-cleared skill must reappear in the catalogue: {updated}"
+    );
+    assert!(
+        updated.contains("- fg-engine-kept:"),
+        "previously listed skill must remain: {updated}"
+    );
+}
+
 #[test]
 fn engine_prompt_respects_hidden_thinking_config() {
     let tmp = tempdir().expect("tempdir");

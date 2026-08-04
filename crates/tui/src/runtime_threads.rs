@@ -3402,6 +3402,8 @@ impl RuntimeThreadManager {
                 goal_status: crate::tools::goal::GoalStatus::Active,
                 allowed_tools: None,
                 disallowed_tools: None,
+                // [pinvou3-fork] automation 线程是无档案会话:None = 回落进程级全局。
+                disabled_skills: None,
                 hook_executor: None,
                 locale_tag: crate::localization::resolve_locale(&settings.locale)
                     .tag()

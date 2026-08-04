@@ -205,6 +205,14 @@ pub enum Op {
     /// Replace the session-scoped model-facing tool deny-list.
     SetDisallowedTools { tools: Vec<String> },
 
+    /// [pinvou3-fork] Replace the session-scoped skill disable-set (session
+    /// capability profile). Sending this op declares the session as profiled:
+    /// an empty vec means "profiled session with every skill enabled", which
+    /// differs from `None` on `EngineConfig.disabled_skills` (no profile —
+    /// fall back to the process-global marketplace set). Takes effect on the
+    /// next turn's system-prompt refresh.
+    SetDisabledSkills { skills: Vec<String> },
+
     /// Update sub-agent runtime controls for subsequent turns.
     SetSubagentRuntimeConfig {
         enabled: bool,

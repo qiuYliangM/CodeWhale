@@ -406,6 +406,12 @@ pub struct EngineConfig {
     /// Tool deny-list.  Deny always wins over allow (#3027).
     /// `None` means no tools are explicitly denied.
     pub disallowed_tools: Option<Vec<String>>,
+    /// [pinvou3-fork] 会话能力档案:本会话的 skill 禁用集。
+    /// `Some(set)` = 有档案会话,catalogue 与 `load_skill` 都以会话集为准
+    /// (**替换**进程级全局 `DISABLED_SKILLS`,非并集);`None` = 无档案会话
+    /// (ACP/CLI 等既有链路),回落全局,行为与档案机制引入前一致。
+    /// 会话内恒定,经 `Op::SetDisabledSkills` 热更后下一轮 prompt 生效。
+    pub disabled_skills: Option<Vec<String>>,
     /// Hook executor for control-plane hooks.
     /// `ToolCallBefore` hooks may deny a tool call with exit code 2.
     pub hook_executor: Option<std::sync::Arc<crate::hooks::HookExecutor>>,
@@ -522,6 +528,7 @@ impl Default for EngineConfig {
             goal_status: GoalStatus::Active,
             allowed_tools: None,
             disallowed_tools: None,
+            disabled_skills: None,
             hook_executor: None,
             locale_tag: "en".to_string(),
             workshop: None,
@@ -1062,6 +1069,7 @@ impl Engine {
                     show_thinking: config.show_thinking,
                     verbosity: config.verbosity.as_deref(),
                     skills_scan_codewhale_only: config.skills_scan_codewhale_only,
+                    disabled_skills: config.disabled_skills.as_deref(),
                 },
             );
         let stable_prompt = Some(system_prompt);
@@ -1904,6 +1912,14 @@ impl Engine {
                     Op::SetDisallowedTools { tools } => {
                         self.config.disallowed_tools =
                             if tools.is_empty() { None } else { Some(tools) };
+                    }
+                    Op::SetDisabledSkills { skills } => {
+                        // [pinvou3-fork] 会话能力档案热更。与 SetDisallowedTools 不同:
+                        // 空集不能塌缩成 None——Some(vec![]) 是「有档案且全部启用」,
+                        // None 是「无档案,回落进程级全局」;发送本 Op 即声明会话有档案。
+                        // catalogue 变化改下一次 prompt 字节(turn loop 每轮
+                        // refresh_system_prompt)→ 该会话一次 prefix-cache miss 后稳定。
+                        self.config.disabled_skills = Some(skills);
                     }
                     Op::SetSubagentRuntimeConfig {
                         enabled,
@@ -3529,6 +3545,10 @@ impl Engine {
             ctx.memory_path = Some(self.config.memory_path.clone());
         }
 
+        // [pinvou3-fork] 会话能力档案:会话级 skill 禁用集下发给 `load_skill`
+        // 判定(Some = 替换进程级全局;None = 无档案会话,回落全局)。
+        ctx.disabled_skills = self.config.disabled_skills.clone();
+
         if let Some(decider) = self.config.network_policy.as_ref() {
             ctx = ctx.with_network_policy(decider.clone());
         }
@@ -3748,6 +3768,7 @@ impl Engine {
                 show_thinking: self.config.show_thinking,
                 verbosity: self.config.verbosity.as_deref(),
                 skills_scan_codewhale_only: self.config.skills_scan_codewhale_only,
+                disabled_skills: self.config.disabled_skills.as_deref(),
             },
         );
         let mut stable_prompt =

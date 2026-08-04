@@ -1627,6 +1627,8 @@ fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
         subagent_token_budget: config.subagent_token_budget_for_provider(provider),
         allowed_tools: app.active_allowed_tools.clone(),
         disallowed_tools: None,
+        // [pinvou3-fork] 交互 TUI 是无档案会话:None = 回落进程级全局 DISABLED_SKILLS。
+        disabled_skills: None,
         hook_executor: app.runtime_services.hook_executor.clone(),
         network_policy: config.network.clone().map(|toml_cfg| {
             crate::network_policy::NetworkPolicyDecider::with_default_audit(toml_cfg.into_runtime())
@@ -1720,6 +1722,8 @@ fn build_app_system_prompt_with_goal(
             show_thinking: app.show_thinking,
             verbosity: app.verbosity.as_deref(),
             skills_scan_codewhale_only: app.skills_scan_codewhale_only,
+            // [pinvou3-fork] 交互 TUI 是无档案会话:None = 回落进程级全局。
+            disabled_skills: None,
         },
     )
 }

@@ -170,6 +170,11 @@ pub struct ToolContext {
     pub skills_dir: Option<PathBuf>,
     /// Restrict skill discovery to CodeWhale-owned roots plus `skills_dir`.
     pub skills_scan_codewhale_only: bool,
+    /// [pinvou3-fork] 会话能力档案:本会话的 skill 禁用集。`Some(set)` = 有档案
+    /// 会话,`load_skill` 以会话集为准(替换进程级全局,非并集);`None` = 无档案
+    /// 会话,回落全局 `DISABLED_SKILLS`。由 engine 构建 ctx 时从
+    /// `EngineConfig.disabled_skills` 盖章(仿 `skills_dir` 逐字段下发先例)。
+    pub disabled_skills: Option<Vec<String>>,
     /// Elevated sandbox policy override (used when retrying after sandbox denial).
     /// This overrides the default sandbox behavior for shell commands.
     pub elevated_sandbox_policy: Option<crate::sandbox::SandboxPolicy>,
@@ -274,6 +279,7 @@ impl ToolContext {
             mcp_config_path,
             skills_dir: None,
             skills_scan_codewhale_only: false,
+            disabled_skills: None,
             elevated_sandbox_policy: None,
             shell_network_denied_hint: None,
             auto_approve: false,
@@ -319,6 +325,7 @@ impl ToolContext {
             mcp_config_path: mcp_config_path.into(),
             skills_dir: None,
             skills_scan_codewhale_only: false,
+            disabled_skills: None,
             elevated_sandbox_policy: None,
             shell_network_denied_hint: None,
             auto_approve: false,
@@ -364,6 +371,7 @@ impl ToolContext {
             mcp_config_path: mcp_config_path.into(),
             skills_dir: None,
             skills_scan_codewhale_only: false,
+            disabled_skills: None,
             elevated_sandbox_policy: None,
             shell_network_denied_hint: None,
             auto_approve,

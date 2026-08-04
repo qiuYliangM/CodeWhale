@@ -88,9 +88,10 @@ impl ToolSpec for LoadSkillTool {
             ));
         }
 
-        // [pinvou3-fork] 技能市场开关:被禁用技能已从 catalogue 隐藏,模型本不该点名;
-        // 但若点了(陈旧/幻觉名),按不可用处理,绝不端出已关技能的正文。
-        if crate::skills::is_skill_disabled(name) {
+        // [pinvou3-fork] 技能市场开关/会话能力档案:被禁用技能已从 catalogue 隐藏,
+        // 模型本不该点名;但若点了(陈旧/幻觉名/猜路径),按不可用处理,绝不端出已关
+        // 技能的正文(纵深防御)。有档案会话以会话集为准(替换全局),无档案会话回落全局。
+        if crate::skills::is_skill_disabled_for_session(name, context.disabled_skills.as_deref()) {
             return Err(ToolError::execution_failed(format!(
                 "skill `{name}` is disabled"
             )));
@@ -437,5 +438,81 @@ mod tests {
             msg.contains("imaginary") && msg.contains("real-one"),
             "error must name the missing skill and list available ones: {msg}"
         );
+    }
+
+    /// [pinvou3-fork] 会话能力档案:有档案会话(ToolContext.disabled_skills = Some)
+    /// 的 `load_skill` 按会话集拒绝——即使进程级全局并未禁用该技能(纵深防御,
+    /// 防陈旧/幻觉/猜名)。回归:execute 的 Some 分支退化为查全局或并集。
+    #[tokio::test]
+    async fn forkguard_load_skill_refuses_session_disabled_skill() {
+        let tmp = tempdir().unwrap();
+        let skills_dir = tmp.path().join("skills");
+        write_skill(&skills_dir, "fg-tool-session-off", "probe", "secret body");
+        write_skill(&skills_dir, "fg-tool-session-on", "probe", "public body");
+
+        let mut context = ToolContext::new(tmp.path()).with_skills_config(&skills_dir, true);
+        context.disabled_skills = Some(vec!["fg-tool-session-off".to_string()]);
+        let tool = LoadSkillTool;
+
+        let err = tool
+            .execute(json!({"name": "fg-tool-session-off"}), &context)
+            .await
+            .expect_err("session-disabled skill must be refused");
+        assert!(
+            err.to_string().contains("fg-tool-session-off"),
+            "refusal must name the skill: {err}"
+        );
+
+        // 同会话未禁的技能不受影响。
+        let ok = tool
+            .execute(json!({"name": "fg-tool-session-on"}), &context)
+            .await
+            .expect("session-enabled skill must load");
+        assert!(ok.success);
+        assert!(ok.content.contains("public body"));
+    }
+
+    /// [pinvou3-fork] 会话能力档案(替换语义锁定 + 无档案回落):
+    /// 1. 全局禁用但会话集未列 → `load_skill` 仍放行(替换而非并集);
+    /// 2. 无档案会话(None)→ 回落进程级全局,全局禁用即拒绝。
+    /// 回归:Some 分支与全局取并集,或 None 分支不再查 `DISABLED_SKILLS`。
+    #[tokio::test]
+    async fn forkguard_load_skill_session_set_replaces_global_and_none_falls_back() {
+        let tmp = tempdir().unwrap();
+        let skills_dir = tmp.path().join("skills");
+        write_skill(
+            &skills_dir,
+            "fg-tool-global-off",
+            "probe",
+            "global-off body",
+        );
+
+        let tool = LoadSkillTool;
+
+        // 1. 替换语义:全局禁用了,但有档案会话的会话集为空(=全部启用)→ 放行。
+        crate::skills::set_disabled_skills(vec!["fg-tool-global-off".to_string()]);
+        let mut profiled = ToolContext::new(tmp.path()).with_skills_config(&skills_dir, true);
+        profiled.disabled_skills = Some(Vec::new());
+        let ok = tool
+            .execute(json!({"name": "fg-tool-global-off"}), &profiled)
+            .await
+            .expect(
+                "globally-disabled skill NOT in the session set must load \
+                     (replace semantics, not union)",
+            );
+        assert!(ok.success);
+        assert!(ok.content.contains("global-off body"));
+
+        // 2. 无档案回落:同一技能,None 上下文 → 查全局,拒绝。
+        let plain = ToolContext::new(tmp.path()).with_skills_config(&skills_dir, true);
+        let err = tool
+            .execute(json!({"name": "fg-tool-global-off"}), &plain)
+            .await
+            .expect_err("no-profile session must fall back to the global set");
+        assert!(
+            err.to_string().contains("fg-tool-global-off"),
+            "refusal must name the skill: {err}"
+        );
+        crate::skills::set_disabled_skills(Vec::new()); // 断言后重置共享全局
     }
 }

@@ -813,18 +813,21 @@ pub(crate) fn discover_for_workspace_and_dir_with_home_and_mode(
 #[must_use]
 pub fn render_available_skills_context_for_workspace(workspace: &Path) -> Option<String> {
     let registry = discover_in_workspace(workspace);
-    render_skills_block(&registry, "en")
+    render_skills_block(&registry, "en", None)
 }
 
 // 注:pinvou3 的 #41「skills 扫描路径只留 ~/.agents/skills」收窄在 skills_directories。
+// [pinvou3-fork] `disabled_skills` = 会话能力档案的会话级禁用集:Some 替换进程级
+// 全局,None 回落全局(见 `is_skill_disabled_for_session`)。
 #[must_use]
 pub fn render_available_skills_context_for_workspace_with_mode(
     workspace: &Path,
     mode: SkillDiscoveryMode,
     locale: &str,
+    disabled_skills: Option<&[String]>,
 ) -> Option<String> {
     let registry = discover_in_workspace_with_mode(workspace, mode);
-    render_skills_block(&registry, locale)
+    render_skills_block(&registry, locale, disabled_skills)
 }
 
 /// Codex's progressive-disclosure contract: the model sees skill names,
@@ -838,7 +841,7 @@ pub fn render_available_skills_context_for_workspace_with_mode(
 #[must_use]
 fn render_available_skills_context(skills_dir: &Path) -> Option<String> {
     let registry = SkillRegistry::discover(skills_dir);
-    render_skills_block(&registry, "en")
+    render_skills_block(&registry, "en", None)
 }
 
 /// Union variant: merge skills discovered in the `workspace` (cross-tool skill
@@ -853,6 +856,7 @@ pub fn render_available_skills_context_for_workspace_and_dir(
         skills_dir,
         SkillDiscoveryMode::Compatible,
         "en",
+        None,
     )
 }
 
@@ -862,17 +866,21 @@ pub fn render_available_skills_context_for_workspace_and_dir_with_mode(
     skills_dir: &Path,
     mode: SkillDiscoveryMode,
     locale: &str,
+    disabled_skills: Option<&[String]>,
 ) -> Option<String> {
     let registry = discover_for_workspace_and_dir_with_mode(workspace, skills_dir, mode);
-    render_skills_block(&registry, locale)
+    render_skills_block(&registry, locale, disabled_skills)
 }
 
-// [pinvou3-fork] 技能市场开关。技能只经 `## Skills` catalogue(render_skills_block)
-// 和 `load_skill` 工具触达模型——两者都查本进程级 disabled 集合,故被关掉的技能从
-// catalogue 消失、也 load 不到。全局(非 per-session)对齐连接器 chip 的"全局持久"语义:
-// 一次 toggle 全 session/窗口继承。bridge 从 `~/.pinvou3/disabled_skills.json` 启动 +
-// 每次 toggle 重设;重设改下一次 prompt 字节 → 一次 prefix-cache miss 后又稳定,与
-// `disabled_connectors`/`disallowed_tools` 同理。不上游(依赖 pinvou3 市场 + bundle/skills)。
+// [pinvou3-fork] 技能市场开关 / 会话能力档案。技能只经 `## Skills` catalogue
+// (render_skills_block) 和 `load_skill` 工具触达模型。本进程级集合已退役为
+// 「无档案会话的默认值」:ACP/CLI 等无档案链路(EngineConfig.disabled_skills = None)
+// 仍查它,行为逐字节不变;有档案会话(Some)以会话集**替换**本全局——非并集,否则
+// plain 禁用集会穿透回代码会话,「plain 关、code 开」不成立(设计文档 §2 替换语义)。
+// 会话集在会话内恒定,catalogue 落在 static 前缀区;热更(Op::SetDisabledSkills)改
+// 下一次 prompt 字节 → 该会话一次 prefix-cache miss 后重新稳定,与 `disallowed_tools`
+// 同理。bridge 从 `~/.pinvou3/disabled_skills.json` 启动 + 每次 toggle 重设本全局。
+// 不上游(依赖 pinvou3 市场 + bundle/skills)。
 static DISABLED_SKILLS: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
 
 /// [pinvou3-fork] 替换被禁用技能名集合(SKILL.md frontmatter `name`,= 磁盘目录名)。
@@ -892,7 +900,23 @@ pub fn is_skill_disabled(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn render_skills_block(registry: &SkillRegistry, locale: &str) -> Option<String> {
+/// [pinvou3-fork] 会话能力档案:`name` 在本会话是否被禁。
+/// `Some(set)` = 有档案会话,以会话集为准(**替换**进程级 `DISABLED_SKILLS`,非并集);
+/// `None` = 无档案会话(ACP/CLI 等既有链路),回落全局,行为与档案机制引入前一致。
+/// catalogue(render_skills_block) 与 `load_skill` 共用本判定,保证两条通道同一份真相。
+#[must_use]
+pub fn is_skill_disabled_for_session(name: &str, session_disabled: Option<&[String]>) -> bool {
+    match session_disabled {
+        Some(set) => set.iter().any(|n| n == name),
+        None => is_skill_disabled(name),
+    }
+}
+
+fn render_skills_block(
+    registry: &SkillRegistry,
+    locale: &str,
+    disabled_skills: Option<&[String]>,
+) -> Option<String> {
     if registry.is_empty() {
         return None;
     }
@@ -909,9 +933,11 @@ instructions when using a specific skill.\n\n",
 
     let mut omitted = 0usize;
     for skill in registry.list() {
-        // [pinvou3-fork] 技能市场开关:跳过用户关掉的技能,使其从 prompt catalogue
-        // 消失(见 `DISABLED_SKILLS`)。
-        if is_skill_disabled(&skill.name) {
+        // [pinvou3-fork] 技能市场开关/会话能力档案:跳过本会话被禁的技能,使其从
+        // prompt catalogue 消失(判定见 `is_skill_disabled_for_session`——有档案
+        // 会话以会话集替换全局,无档案会话回落全局)。catalogue 不印名字/路径,
+        // read_file 侧路随之封死,这里是封口点。
+        if is_skill_disabled_for_session(&skill.name, disabled_skills) {
             continue;
         }
         // Use the real on-disk path captured at discovery — the directory
@@ -1169,7 +1195,7 @@ mod tests {
             });
         }
 
-        let rendered = super::render_skills_block(&registry, "en").expect("skill context");
+        let rendered = super::render_skills_block(&registry, "en", None).expect("skill context");
         assert!(
             rendered.contains("workspace-priority"),
             "higher-precedence workspace skills must not be reordered behind globals:\n{rendered}"
@@ -1283,14 +1309,14 @@ body";
             path: std::path::PathBuf::from("/skills/compress/SKILL.md"),
         });
 
-        let zh = super::render_skills_block(&registry, "zh-Hans").expect("zh block");
+        let zh = super::render_skills_block(&registry, "zh-Hans", None).expect("zh block");
         assert!(
             zh.contains("压缩日志的技能"),
             "zh session should get the zh description:\n{zh}"
         );
         assert!(!zh.contains("Compress logs to save space"));
 
-        let en = super::render_skills_block(&registry, "en").expect("en block");
+        let en = super::render_skills_block(&registry, "en", None).expect("en block");
         assert!(
             en.contains("Compress logs to save space"),
             "en session keeps default:\n{en}"
@@ -2239,7 +2265,7 @@ body";
 
         // 唯一禁用名,避免并行测试的共享全局互相影响。
         super::set_disabled_skills(vec!["fg-victim-skill".to_string()]);
-        let rendered = super::render_skills_block(&registry, "en").expect("skills block");
+        let rendered = super::render_skills_block(&registry, "en", None).expect("skills block");
         super::set_disabled_skills(Vec::new()); // 断言前重置共享全局
 
         assert!(
@@ -2250,5 +2276,74 @@ body";
             !rendered.contains("fg-victim-skill"),
             "disabled skill must be hidden: {rendered}"
         );
+    }
+
+    /// [pinvou3-fork] 会话能力档案(替换语义锁定,两方向):
+    /// 1. 全局未禁但会话集禁用 → catalogue 隐藏(会话集生效);
+    /// 2. 全局禁用但会话集未列 → catalogue 仍列出(替换而非并集——若退化成并集,
+    ///    plain 禁用集会穿透回代码会话,「plain 关、code 开」不成立)。
+    /// 回归:`is_skill_disabled_for_session` 的 Some 分支与全局取并/交集。
+    #[test]
+    fn forkguard_session_profile_replaces_global_set_in_catalogue() {
+        let tmpdir = TempDir::new().unwrap();
+        for n in ["fg-global-off-skill", "fg-session-off-skill"] {
+            let dir = tmpdir.path().join(n);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("SKILL.md"),
+                format!("---\nname: {n}\ndescription: probe\n---\nbody"),
+            )
+            .unwrap();
+        }
+        let registry = super::SkillRegistry::discover(tmpdir.path());
+
+        // 全局禁 fg-global-off-skill;会话集只禁 fg-session-off-skill。
+        super::set_disabled_skills(vec!["fg-global-off-skill".to_string()]);
+        let session_set = vec!["fg-session-off-skill".to_string()];
+        let rendered =
+            super::render_skills_block(&registry, "en", Some(&session_set)).expect("skills block");
+        super::set_disabled_skills(Vec::new()); // 断言前重置共享全局
+
+        assert!(
+            !rendered.contains("fg-session-off-skill"),
+            "session-disabled skill must be hidden even though the global set allows it: {rendered}"
+        );
+        assert!(
+            rendered.contains("fg-global-off-skill"),
+            "globally-disabled skill NOT in the session set must still be listed \
+             (replace semantics, not union): {rendered}"
+        );
+    }
+
+    /// [pinvou3-fork] 会话能力档案 golden:无档案会话(disabled_skills = None)行为与
+    /// 进程级全局逐字节一致——Some(会话集) 与 None(全局) 渲染出完全相同的 catalogue,
+    /// 锁定 ACP/CLI 等既有链路零变化。
+    #[test]
+    fn forkguard_session_profile_none_matches_global_byte_for_byte() {
+        let tmpdir = TempDir::new().unwrap();
+        for n in ["fg-golden-kept", "fg-golden-blocked"] {
+            let dir = tmpdir.path().join(n);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("SKILL.md"),
+                format!("---\nname: {n}\ndescription: probe\n---\nbody"),
+            )
+            .unwrap();
+        }
+        let registry = super::SkillRegistry::discover(tmpdir.path());
+
+        super::set_disabled_skills(vec!["fg-golden-blocked".to_string()]);
+        let global_view = super::render_skills_block(&registry, "en", None).expect("skills block");
+        let session_view =
+            super::render_skills_block(&registry, "en", Some(&["fg-golden-blocked".to_string()]))
+                .expect("skills block");
+        super::set_disabled_skills(Vec::new()); // 断言前重置共享全局
+
+        assert_eq!(
+            global_view, session_view,
+            "None (global fallback) and Some(same set) must render identical catalogues"
+        );
+        assert!(global_view.contains("fg-golden-kept"));
+        assert!(!global_view.contains("fg-golden-blocked"));
     }
 }
