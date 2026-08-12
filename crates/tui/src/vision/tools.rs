@@ -5,14 +5,17 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use futures_util::StreamExt;
 use serde_json::{Value, json};
 
 use crate::config::VisionModelConfig;
-use crate::llm_client::{LlmError, RetryConfig, sanitize_http_error_body, with_retry};
+use crate::llm_client::sanitize_http_error_body;
 use crate::tools::spec::{
     ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec, required_str,
 };
 
+// 统一输出上限(本地/云端一致):4096 覆盖长文档转写。慢设备上生成不满
+// 4096 时由流式超时(300s)截断返回部分内容(truncated 标记),不会重试死循环。
 const DEFAULT_VISION_MAX_OUTPUT_TOKENS: u32 = 4096;
 
 pub struct ImageAnalyzeTool {
@@ -23,8 +26,11 @@ pub struct ImageAnalyzeTool {
 impl ImageAnalyzeTool {
     #[must_use]
     pub fn new(config: VisionModelConfig) -> Self {
+        // Pinvou fork:流式接收后不再设整体 timeout(reqwest 整体超时会在
+        // 300s 掐断流,拿不到部分内容);总时长由 execute 的流式循环 300s
+        // 控制,超时返回已累积内容(truncated 标记)。连接阶段仍限 30s 防挂死。
         let client = crate::tls::reqwest_client_builder()
-            .timeout(Duration::from_secs(120))
+            .connect_timeout(Duration::from_secs(30))
             .build()
             .expect("Failed to build HTTP client");
         Self { config, client }
@@ -122,9 +128,18 @@ impl ImageAnalyzeTool {
     }
 
     fn request_payload(&self, prompt: &str, image_data: &str, mime_type: &str) -> Value {
+        // Pinvou fork:system prompt 约束转写纪律(小模型对引导敏感)+
+        // temperature 0.7 → 0.2(转写类任务低温度减少幻觉)。
         let mut payload = json!({
             "model": self.config.model,
             "messages": [
+                {
+                    "role": "system",
+                    "content": "You are an image content analyst. Describe the image accurately: \
+                       1) the image type (screenshot / photo / document / chart); \
+                       2) all visible text, transcribed verbatim in its original language; \
+                       3) key visual elements and layout. Never fabricate details you cannot see."
+                },
                 {
                     "role": "user",
                     "content": [
@@ -138,7 +153,7 @@ impl ImageAnalyzeTool {
                     ]
                 }
             ],
-            "temperature": 0.7
+            "temperature": 0.2
         });
 
         let token_limit_field = if Self::uses_max_completion_tokens(&self.config) {
@@ -147,6 +162,8 @@ impl ImageAnalyzeTool {
             "max_tokens"
         };
         payload[token_limit_field] = json!(DEFAULT_VISION_MAX_OUTPUT_TOKENS);
+        // Pinvou fork:流式接收——超时(300s)时返回已生成的部分内容而非整请求失败。
+        payload["stream"] = json!(true);
 
         payload
     }
@@ -186,10 +203,16 @@ impl ToolSpec for ImageAnalyzeTool {
 
     async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
         let image_path = required_str(&input, "image_path")?;
+        // Pinvou fork:默认提示词增强(主模型不传时质量兜底):
+        // 类型/文字转写/元素布局三要素,与 system prompt 同向。
         let prompt = input
             .get("prompt")
             .and_then(|v| v.as_str())
-            .unwrap_or("Describe this image in detail.");
+            .unwrap_or(
+                "Describe this image accurately: the image type (screenshot / photo / \
+                 document / chart), all visible text transcribed verbatim, and the key \
+                 visual elements and layout.",
+            );
 
         let resolved_path = Self::resolve_image_path(&context.workspace, image_path)?;
         let (image_data, mime_type) = Self::read_image_file(&resolved_path).await?;
@@ -199,76 +222,97 @@ impl ToolSpec for ImageAnalyzeTool {
         let url = format!("{}/chat/completions", self.base_url());
         let api_key = self.api_key();
 
-        let retry_config = RetryConfig {
-            max_retries: 3,
-            initial_delay: 1.0,
-            max_delay: 30.0,
-            enabled: true,
-            ..Default::default()
-        };
-
-        let response = with_retry(
-            &retry_config,
-            || {
-                let client = self.client.clone();
-                let url = url.clone();
-                let api_key = api_key.clone();
-                let payload = payload.clone();
-                async move {
-                    let response = client
-                        .post(&url)
-                        .header("Content-Type", "application/json")
-                        .header("Authorization", format!("Bearer {api_key}"))
-                        .json(&payload)
-                        .send()
-                        .await
-                        .map_err(|e| LlmError::from_reqwest(&e))?;
-
-                    let status = response.status();
-                    if !status.is_success() {
-                        let error_text = response
-                            .text()
-                            .await
-                            .unwrap_or_else(|_| "Unknown error".to_string());
-                        let error_text = sanitize_http_error_body(
-                            Some("Vision provider"),
-                            status.as_u16(),
-                            &error_text,
-                        );
-                        return Err(LlmError::from_http_response(status.as_u16(), &error_text));
-                    }
-                    Ok(response)
-                }
-            },
-            None,
-        )
-        .await
-        .map_err(|e| ToolError::execution_failed(format!("Vision API request failed: {e}")))?;
-
-        let json: Value = response
-            .json()
+        // Pinvou fork:流式接收(stream: true,见 request_payload)。总时长 300s
+        // 上限;超时返回已累积的部分内容(truncated 标记),慢设备/长文档不会
+        // 整请求失败触发重试死循环。连接失败/HTTP 错误仍直接报错。
+        let response = self
+            .client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Bearer {api_key}"))
+            .json(&payload)
+            .send()
             .await
-            .map_err(|e| ToolError::execution_failed(format!("Failed to parse response: {e}")))?;
+            .map_err(|e| ToolError::execution_failed(format!("Vision API request failed: {e}")))?;
 
-        let content = json
-            .get("choices")
-            .and_then(|c| c.get(0))
-            .and_then(|c| c.get("message"))
-            .and_then(|m| m.get("content"))
-            .and_then(|c| c.as_str())
-            .unwrap_or("")
-            .to_string();
+        let status = response.status();
+        if !status.is_success() {
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            let error_text =
+                sanitize_http_error_body(Some("Vision provider"), status.as_u16(), &error_text);
+            return Err(ToolError::execution_failed(format!(
+                "Vision API request failed: {error_text}"
+            )));
+        }
 
-        let model = json
-            .get("model")
-            .and_then(|m| m.as_str())
-            .unwrap_or(&self.config.model)
-            .to_string();
+        // 流式累积:行缓冲解析 SSE(data: {json}),超时截断时保留已累积内容。
+        let mut content = String::new();
+        let mut truncated = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(300);
+        let mut buffer = String::new();
+        let mut stream = response.bytes_stream();
+        'stream: loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                truncated = true;
+                break;
+            }
+            let chunk = match tokio::time::timeout(remaining, stream.next()).await {
+                Ok(Some(Ok(chunk))) => chunk,
+                Ok(Some(Err(e))) => {
+                    return Err(ToolError::execution_failed(format!(
+                        "Vision stream error: {e}"
+                    )))
+                }
+                Ok(None) => break, // 流正常结束
+                Err(_) => {
+                    truncated = true;
+                    break;
+                }
+            };
+            buffer.push_str(&String::from_utf8_lossy(&chunk));
+            while let Some(pos) = buffer.find('\n') {
+                let line = buffer[..pos].trim().to_string();
+                buffer = buffer[pos + 1..].to_string();
+                if !line.starts_with("data:") {
+                    continue;
+                }
+                let data = line[5..].trim();
+                if data == "[DONE]" {
+                    break 'stream;
+                }
+                let Ok(event) = serde_json::from_str::<Value>(data) else {
+                    continue;
+                };
+                if let Some(delta) = event
+                    .pointer("/choices/0/delta/content")
+                    .and_then(|c| c.as_str())
+                {
+                    content.push_str(delta);
+                }
+                if event
+                    .pointer("/choices/0/finish_reason")
+                    .and_then(|f| f.as_str())
+                    == Some("length")
+                {
+                    truncated = true;
+                }
+            }
+        }
 
-        let result = json!({
+        // 流式响应无 model 字段,回退配置值(与上游非流式行为一致)。
+        let model = self.config.model.clone();
+
+        let mut result = json!({
             "analysis": content,
             "model": model,
         });
+        if truncated {
+            result["truncated"] = json!(true);
+        }
 
         ToolResult::json(&result)
             .map_err(|e| ToolError::execution_failed(format!("Failed to serialize result: {e}")))
