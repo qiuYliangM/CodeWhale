@@ -2967,6 +2967,30 @@ pub struct VisionModelConfig {
     /// Base URL for the vision model API. Defaults to OpenAI.
     #[serde(default)]
     pub base_url: Option<String>,
+    /// System prompt for the vision request. Falls back to the built-in
+    /// transcription-discipline prompt when not set.
+    #[serde(default)]
+    pub system_prompt: Option<String>,
+    /// Default user prompt used when the caller does not pass a `prompt`.
+    /// Falls back to the built-in three-part template when not set.
+    #[serde(default)]
+    pub default_prompt: Option<String>,
+    /// Max output tokens for the vision response (`max_tokens` /
+    /// `max_completion_tokens`). Defaults to 4096.
+    #[serde(default)]
+    pub max_output_tokens: Option<u32>,
+    /// Sampling temperature. Defaults to 0.2.
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    /// Total per-request budget in seconds, counted from just before `send()`
+    /// (covers waiting for response headers and the whole stream). Defaults
+    /// to 90.
+    #[serde(default)]
+    pub request_timeout_secs: Option<u64>,
+    /// Whether to request SSE streaming (`stream: true`). Defaults to true;
+    /// set false for endpoints that do not support streaming.
+    #[serde(default)]
+    pub stream: Option<bool>,
 }
 
 /// `[runtime_api]` table — knobs for the local HTTP/SSE daemon.
