@@ -306,6 +306,9 @@ pub struct ExecPolicyContext<'a> {
     pub ask_for_approval: AskForApproval,
     /// The sandbox mode in effect, if any (e.g. `"workspace-write"`).
     pub sandbox_mode: Option<&'a str>,
+    /// Additional workspace roots for path/scope matching; `cwd` remains the
+    /// primary root. Empty preserves the historical single-root matching.
+    pub workspace_roots: Vec<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -387,9 +390,23 @@ impl ExecPolicyEngine {
 
     fn matching_ask_rule(&self, ctx: &ExecPolicyContext<'_>) -> Option<ToolAskRule> {
         let tool = ctx.tool.unwrap_or("exec_shell");
-        let normalized_path = ctx
-            .path
-            .and_then(|path| normalize_workspace_relative_path(path, ctx.cwd));
+        // Boundary roots for path/scope matching: the primary cwd plus any
+        // additional roots. A rule path or scope that resolves against any
+        // single root matches; an empty root set keeps single-root behavior.
+        let mut roots: Vec<String> = vec![ctx.cwd.to_string()];
+        for root in &ctx.workspace_roots {
+            let root = root.to_string_lossy().into_owned();
+            if !roots.contains(&root) {
+                roots.push(root);
+            }
+        }
+        let normalized_paths: Vec<Option<String>> = roots
+            .iter()
+            .map(|root| {
+                ctx.path
+                    .and_then(|path| normalize_workspace_relative_path(path, root))
+            })
+            .collect();
 
         self.rulesets
             .iter()
@@ -401,9 +418,11 @@ impl ExecPolicyEngine {
             })
             .filter(|(_, rule)| rule.tool == tool)
             .filter(|(_, rule)| {
-                rule.workspace
-                    .as_deref()
-                    .is_none_or(|workspace| workspace_scope_matches(workspace, ctx.cwd))
+                rule.workspace.as_deref().is_none_or(|workspace| {
+                    roots
+                        .iter()
+                        .any(|root| workspace_scope_matches(workspace, root))
+                })
             })
             .filter(|(_, rule)| match rule.command.as_deref() {
                 Some(command) if rule.command_exact => command.trim() == ctx.command.trim(),
@@ -411,13 +430,20 @@ impl ExecPolicyEngine {
                 None => true,
             })
             .filter(|(_, rule)| match (rule.path.as_deref(), ctx.path) {
-                (Some(pattern), Some(_)) => match (
-                    normalize_workspace_relative_path(pattern, ctx.cwd),
-                    normalized_path.as_deref(),
-                ) {
-                    (Some(pattern), Some(path)) => pattern == path,
-                    _ => false,
-                },
+                (Some(pattern), Some(_)) => {
+                    roots
+                        .iter()
+                        .zip(&normalized_paths)
+                        .any(|(root, normalized_path)| {
+                            match (
+                                normalize_workspace_relative_path(pattern, root),
+                                normalized_path.as_deref(),
+                            ) {
+                                (Some(pattern), Some(path)) => pattern == path,
+                                _ => false,
+                            }
+                        })
+                }
                 (Some(_), None) => false,
                 (None, _) => true,
             })
@@ -1057,6 +1083,7 @@ mod tests {
             path: None,
             ask_for_approval,
             sandbox_mode: Some("workspace-write"),
+            workspace_roots: Vec::new(),
         }
     }
 
@@ -1793,6 +1820,7 @@ mod tests {
                 path: Some("tmp/project"),
                 ask_for_approval: AskForApproval::Never,
                 sandbox_mode: Some("workspace-write"),
+                workspace_roots: Vec::new(),
             })
             .unwrap();
 
@@ -1817,6 +1845,7 @@ mod tests {
                 path: Some("/workspace/src/a.rs"),
                 ask_for_approval: AskForApproval::OnFailure,
                 sandbox_mode: Some("workspace-write"),
+                workspace_roots: Vec::new(),
             })
             .unwrap();
         assert!(absolute_path.requires_approval);
@@ -1833,6 +1862,7 @@ mod tests {
                 path: Some("src/a.rs"),
                 ask_for_approval: AskForApproval::OnFailure,
                 sandbox_mode: Some("workspace-write"),
+                workspace_roots: Vec::new(),
             })
             .unwrap();
         assert!(relative_path.requires_approval);
@@ -1859,6 +1889,7 @@ mod tests {
                     path: Some(path),
                     ask_for_approval: AskForApproval::OnFailure,
                     sandbox_mode: Some("workspace-write"),
+                    workspace_roots: Vec::new(),
                 })
                 .unwrap();
             assert_eq!(
@@ -1883,10 +1914,118 @@ mod tests {
                 path: Some(r"C:\workspace\src\a.rs"),
                 ask_for_approval: AskForApproval::OnFailure,
                 sandbox_mode: Some("workspace-write"),
+                workspace_roots: Vec::new(),
             })
             .unwrap();
 
         assert!(decision.requires_approval);
+    }
+
+    #[test]
+    fn typed_ask_path_matching_spans_additional_workspace_roots() {
+        // A relative rule path matches an invocation path under any root.
+        let engine = ExecPolicyEngine::with_rulesets(vec![
+            Ruleset::user(vec![], vec![])
+                .with_ask_rules(vec![ToolAskRule::file_path("edit_file", "src/a.rs")]),
+        ]);
+        let decision = engine
+            .check(ExecPolicyContext {
+                command: "",
+                cwd: "/workspace",
+                tool: Some("edit_file"),
+                path: Some("/shared/src/a.rs"),
+                ask_for_approval: AskForApproval::OnFailure,
+                sandbox_mode: Some("workspace-write"),
+                workspace_roots: vec![std::path::PathBuf::from("/shared")],
+            })
+            .unwrap();
+        assert!(
+            decision.requires_approval,
+            "relative rule path must match under the additional root: {decision:?}"
+        );
+
+        // The same path with no additional root configured must not match.
+        let decision = engine
+            .check(ExecPolicyContext {
+                command: "",
+                cwd: "/workspace",
+                tool: Some("edit_file"),
+                path: Some("/shared/src/a.rs"),
+                ask_for_approval: AskForApproval::OnFailure,
+                sandbox_mode: Some("workspace-write"),
+                workspace_roots: Vec::new(),
+            })
+            .unwrap();
+        assert_eq!(decision.matched_rule, None);
+
+        // An absolute rule anchored at the additional root matches there but
+        // does not leak onto the same relative path under the primary root.
+        let anchored =
+            ExecPolicyEngine::with_rulesets(vec![Ruleset::user(vec![], vec![]).with_ask_rules(
+                vec![ToolAskRule::file_path("edit_file", "/shared/src/a.rs")],
+            )]);
+        let under_shared = anchored
+            .check(ExecPolicyContext {
+                command: "",
+                cwd: "/workspace",
+                tool: Some("edit_file"),
+                path: Some("/shared/src/a.rs"),
+                ask_for_approval: AskForApproval::OnFailure,
+                sandbox_mode: Some("workspace-write"),
+                workspace_roots: vec![std::path::PathBuf::from("/shared")],
+            })
+            .unwrap();
+        assert!(under_shared.requires_approval);
+        let under_primary = anchored
+            .check(ExecPolicyContext {
+                command: "",
+                cwd: "/workspace",
+                tool: Some("edit_file"),
+                path: Some("/workspace/src/a.rs"),
+                ask_for_approval: AskForApproval::OnFailure,
+                sandbox_mode: Some("workspace-write"),
+                workspace_roots: vec![std::path::PathBuf::from("/shared")],
+            })
+            .unwrap();
+        assert_eq!(under_primary.matched_rule, None);
+    }
+
+    #[test]
+    fn workspace_scoped_rule_matches_any_workspace_root() {
+        let rule = ToolAskRule::exec_shell("git push").into_exact_workspace_allow("/shared");
+        let engine = ExecPolicyEngine::with_rulesets(vec![
+            Ruleset::user(vec![], vec![]).with_ask_rules(vec![rule]),
+        ]);
+
+        let scoped = engine
+            .check(ExecPolicyContext {
+                command: "git push",
+                cwd: "/workspace",
+                tool: Some("exec_shell"),
+                path: None,
+                ask_for_approval: AskForApproval::UnlessTrusted,
+                sandbox_mode: Some("workspace-write"),
+                workspace_roots: vec![std::path::PathBuf::from("/shared")],
+            })
+            .unwrap();
+        assert!(
+            scoped.allow && !scoped.requires_approval,
+            "rule scoped to an additional root must apply: {scoped:?}"
+        );
+
+        // Without the root in the set the scope does not match.
+        let unscoped = engine
+            .check(ExecPolicyContext {
+                command: "git push",
+                cwd: "/workspace",
+                tool: Some("exec_shell"),
+                path: None,
+                ask_for_approval: AskForApproval::UnlessTrusted,
+                sandbox_mode: Some("workspace-write"),
+                workspace_roots: Vec::new(),
+            })
+            .unwrap();
+        assert_eq!(unscoped.matched_rule, None);
     }
 
     // ── deny / allow action tests ──────────────────────────────────────────
@@ -1913,6 +2052,7 @@ mod tests {
                 path: None,
                 ask_for_approval: AskForApproval::UnlessTrusted,
                 sandbox_mode: None,
+                workspace_roots: Vec::new(),
             })
             .unwrap();
 
@@ -1949,6 +2089,7 @@ mod tests {
                 path: None,
                 ask_for_approval: AskForApproval::OnRequest,
                 sandbox_mode: None,
+                workspace_roots: Vec::new(),
             })
             .unwrap();
 
@@ -1974,6 +2115,7 @@ mod tests {
                 path: None,
                 ask_for_approval: AskForApproval::UnlessTrusted,
                 sandbox_mode: None,
+                workspace_roots: Vec::new(),
             })
             .unwrap();
 
@@ -2008,6 +2150,7 @@ mod tests {
                 path: None,
                 ask_for_approval: AskForApproval::OnRequest,
                 sandbox_mode: None,
+                workspace_roots: Vec::new(),
             })
             .unwrap();
 
@@ -2276,6 +2419,7 @@ mod tests {
                 path: Some("/workspace/src/secrets.rs"),
                 ask_for_approval: UnlessTrusted,
                 sandbox_mode: None,
+                workspace_roots: Vec::new(),
             })
             .unwrap();
 
@@ -2616,6 +2760,7 @@ mod tests {
                 path: Some("/workspace/src/main.rs"),
                 ask_for_approval: UnlessTrusted,
                 sandbox_mode: None,
+                workspace_roots: Vec::new(),
             })
             .unwrap();
         // write_file should not be affected by exec_shell deny
@@ -2678,6 +2823,7 @@ mod tests {
                 path: None,
                 ask_for_approval: OnRequest,
                 sandbox_mode: Some("workspace-write"),
+                workspace_roots: Vec::new(),
             })
             .unwrap();
         assert!(
@@ -2751,6 +2897,7 @@ mod tests {
                 path: None,
                 ask_for_approval: OnRequest,
                 sandbox_mode: Some("workspace-write"),
+                workspace_roots: Vec::new(),
             })
             .unwrap();
 
@@ -2819,6 +2966,7 @@ mod tests {
             path: Some(path),
             ask_for_approval,
             sandbox_mode: Some("workspace-write"),
+            workspace_roots: Vec::new(),
         }
     }
 }

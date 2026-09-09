@@ -4187,6 +4187,7 @@ fn run_sandbox_command(command: SandboxCommand) -> Result<()> {
                 path: None,
                 ask_for_approval: ask.into(),
                 sandbox_mode: Some("workspace-write"),
+                workspace_roots: Vec::new(),
             })?;
             println!("{}", serde_json::to_string_pretty(&decision)?);
             Ok(())

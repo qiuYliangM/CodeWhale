@@ -155,6 +155,7 @@ fn safety_summary(app: &App) -> &'static str {
         app.approval_mode,
         app.configured_sandbox_mode.as_deref(),
         &app.workspace,
+        &[],
     );
     // The policy is the intent; `sandbox_backend` is what this platform can
     // actually enforce with. Default Linux (bubblewrap is opt-in) and all

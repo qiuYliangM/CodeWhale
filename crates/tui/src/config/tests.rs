@@ -545,6 +545,7 @@ command = "cargo test"
             path: None,
             ask_for_approval: codewhale_execpolicy::AskForApproval::OnFailure,
             sandbox_mode: None,
+            workspace_roots: Vec::new(),
         })
         .expect("check permission");
 
@@ -580,6 +581,7 @@ command = "npm test"
             path: None,
             ask_for_approval: codewhale_execpolicy::AskForApproval::OnFailure,
             sandbox_mode: None,
+            workspace_roots: Vec::new(),
         })
         .expect("check permission");
 

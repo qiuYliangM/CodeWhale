@@ -10405,6 +10405,7 @@ async fn build_direct_workflow_tool(
         },
         config.sandbox_mode.as_deref(),
         workspace,
+        &[],
     ));
     let network_policy = config.network.clone().map(|network| {
         crate::network_policy::NetworkPolicyDecider::with_default_audit(network.into_runtime())
@@ -11000,6 +11001,9 @@ async fn run_exec_agent(
         model: effective_model.clone(),
         active_route_limits,
         workspace: workspace.clone(),
+        workspace_roots: resume_session
+            .as_ref()
+            .map_or_else(Vec::new, |saved| saved.metadata.workspace_roots.clone()),
         subagent_state_root: None,
         plugin_registry: Some(engine_plugin_registry),
         allow_shell: crate::tools::spec::fleet_exec_shell_enabled(

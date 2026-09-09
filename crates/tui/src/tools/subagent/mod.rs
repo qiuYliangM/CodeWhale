@@ -12837,6 +12837,7 @@ impl SubAgentToolRegistry {
         }
         crate::core::authority::paths_within_workspace_write_carve_out(
             &self.registry.context().workspace,
+            &self.registry.context().workspace_roots,
             &raw_mutation_target_paths(name, input),
         )
     }

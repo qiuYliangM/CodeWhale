@@ -599,6 +599,7 @@ fn filesystem_scope_label(app: &App) -> Cow<'static, str> {
         app.approval_mode,
         app.configured_sandbox_mode.as_deref(),
         &app.workspace,
+        &[],
     );
     // A policy is an intent; enforcement needs a backend. On default Linux
     // (bubblewrap is opt-in) and on all Windows there is none, and this chip

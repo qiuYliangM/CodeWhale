@@ -219,6 +219,7 @@ impl TurnAuthority {
     pub(crate) fn sandbox_policy(
         &self,
         workspace: &Path,
+        workspace_roots: &[PathBuf],
         configured_mode: Option<&str>,
     ) -> SandboxPolicy {
         sandbox_policy_for_turn(
@@ -226,6 +227,7 @@ impl TurnAuthority {
             self.approval_mode_for_session(),
             configured_mode,
             workspace,
+            workspace_roots,
         )
     }
 }
@@ -339,13 +341,14 @@ pub(crate) fn sandbox_policy_for_turn(
     approval_mode: ApprovalMode,
     configured_mode: Option<&str>,
     workspace: &Path,
+    workspace_roots: &[PathBuf],
 ) -> SandboxPolicy {
     let default = if mode == AppMode::Plan {
         SandboxPolicy::ReadOnly
     } else if mode == AppMode::Yolo || approval_mode == ApprovalMode::Bypass {
         SandboxPolicy::DangerFullAccess
     } else {
-        workspace_write_policy(workspace)
+        workspace_write_policy(workspace, workspace_roots)
     };
 
     // The effective Config has already applied managed/project precedence.
@@ -354,7 +357,7 @@ pub(crate) fn sandbox_policy_for_turn(
     match (default, configured_mode) {
         (SandboxPolicy::ReadOnly, _) | (_, Some("read-only")) => SandboxPolicy::ReadOnly,
         (SandboxPolicy::DangerFullAccess, Some("workspace-write")) => {
-            workspace_write_policy(workspace)
+            workspace_write_policy(workspace, workspace_roots)
         }
         (SandboxPolicy::DangerFullAccess, Some("external-sandbox")) => {
             SandboxPolicy::ExternalSandbox {
@@ -365,9 +368,13 @@ pub(crate) fn sandbox_policy_for_turn(
     }
 }
 
-fn workspace_write_policy(workspace: &Path) -> SandboxPolicy {
+/// The per-turn materialization of [`crate::sandbox::policy::WORKSPACE_ROOTS_SYMBOL`]:
+/// `workspace` stays the primary writable root and the normalized additional
+/// roots follow it. An empty `workspace_roots` degenerates to `[workspace]`,
+/// exactly the historical single-root policy.
+fn workspace_write_policy(workspace: &Path, workspace_roots: &[PathBuf]) -> SandboxPolicy {
     SandboxPolicy::WorkspaceWrite {
-        writable_roots: vec![workspace.to_path_buf()],
+        writable_roots: codewhale_core::normalize_workspace_roots(workspace, workspace_roots),
         network_access: true,
         exclude_tmpdir: false,
         exclude_slash_tmp: false,
@@ -464,30 +471,42 @@ pub(crate) fn write_carve_out_posture(
 }
 
 /// Whether every target path of a file-write call qualifies for the
-/// in-workspace write carve-out (#5185): the workspace is a git work tree,
-/// each path resolves inside it, and none touches `.git` internals, runtime
-/// state, or a sensitive file.
+/// in-workspace write carve-out (#5185): each path resolves inside at least
+/// one workspace root (primary or additional), that root is a git work tree,
+/// and the path touches no `.git` internals, runtime state, or sensitive
+/// file. Every root is judged independently.
 ///
 /// The git work-tree marker is deliberate (the same shape as kimi-code's
 /// `git-cwd-write-approve` policy): the carve-out exists because
 /// version-controlled edits stay reviewable and recoverable, so a workspace
 /// without git keeps the modal.
 #[must_use]
-pub(crate) fn paths_within_workspace_write_carve_out(workspace: &Path, paths: &[String]) -> bool {
+pub(crate) fn paths_within_workspace_write_carve_out(
+    workspace: &Path,
+    workspace_roots: &[PathBuf],
+    paths: &[String],
+) -> bool {
     if paths.is_empty() {
         return false;
     }
+    let roots = codewhale_core::normalize_workspace_roots(workspace, workspace_roots);
+    paths.iter().all(|raw| {
+        roots
+            .iter()
+            .any(|root| carve_out_target_within_root(root, raw))
+    })
+}
+
+fn carve_out_target_within_root(root: &Path, raw: &str) -> bool {
     // `.git` may be a directory (normal checkout) or a file (worktree or
     // submodule); either marks a git work tree.
-    if workspace.join(".git").symlink_metadata().is_err() {
+    if root.join(".git").symlink_metadata().is_err() {
         return false;
     }
-    let Ok(workspace_canonical) = workspace.canonicalize() else {
+    let Ok(root_canonical) = root.canonicalize() else {
         return false;
     };
-    paths
-        .iter()
-        .all(|raw| carve_out_target_allowed(workspace, &workspace_canonical, raw))
+    carve_out_target_allowed(root, &root_canonical, raw)
 }
 
 fn carve_out_target_allowed(workspace: &Path, workspace_canonical: &Path, raw: &str) -> bool {
@@ -728,7 +747,7 @@ mod tests {
             vec!["src/main.rs".to_string(), "src/other.rs".to_string()],
         ] {
             assert!(
-                paths_within_workspace_write_carve_out(workspace, &paths),
+                paths_within_workspace_write_carve_out(workspace, &[], &paths),
                 "{paths:?} should qualify"
             );
         }
@@ -755,7 +774,7 @@ mod tests {
             vec!["src/main.rs".to_string(), ".env".to_string()],
         ] {
             assert!(
-                !paths_within_workspace_write_carve_out(workspace, &paths),
+                !paths_within_workspace_write_carve_out(workspace, &[], &paths),
                 "{paths:?} must keep the modal"
             );
         }
@@ -766,6 +785,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         assert!(!paths_within_workspace_write_carve_out(
             tmp.path(),
+            &[],
             &["src/main.rs".to_string()]
         ));
     }
@@ -773,7 +793,89 @@ mod tests {
     #[test]
     fn carve_out_rejects_empty_target_list() {
         let tmp = carve_out_workspace();
-        assert!(!paths_within_workspace_write_carve_out(tmp.path(), &[]));
+        assert!(!paths_within_workspace_write_carve_out(
+            tmp.path(),
+            &[],
+            &[]
+        ));
+    }
+
+    #[test]
+    fn workspace_write_policy_materializes_additional_roots() {
+        let workspace = Path::new("/work");
+        let agent = authority(AppMode::Agent, false, ApprovalMode::Suggest);
+        let roots = vec![PathBuf::from("/shared"), PathBuf::from("/work")];
+
+        let policy = agent.sandbox_policy(workspace, &roots, None);
+        let SandboxPolicy::WorkspaceWrite { writable_roots, .. } = policy else {
+            panic!("agent posture must stay workspace-write");
+        };
+        assert_eq!(
+            writable_roots,
+            vec![PathBuf::from("/work"), PathBuf::from("/shared")],
+            "the primary root stays first and duplicates are removed"
+        );
+
+        // An empty root set is byte-identical to the historical single-root
+        // policy.
+        let single = agent.sandbox_policy(workspace, &[], None);
+        let SandboxPolicy::WorkspaceWrite {
+            writable_roots: single_roots,
+            ..
+        } = single
+        else {
+            panic!("agent posture must stay workspace-write");
+        };
+        assert_eq!(single_roots, vec![workspace.to_path_buf()]);
+    }
+
+    #[test]
+    fn carve_out_spans_additional_roots_independently() {
+        let primary = carve_out_workspace();
+        let shared = carve_out_workspace();
+        let no_git = tempfile::tempdir().expect("no-git tempdir");
+        let roots = vec![shared.path().to_path_buf(), no_git.path().to_path_buf()];
+        let workspace = primary.path();
+
+        // A target inside an additional git work tree qualifies, named
+        // relative to that root.
+        assert!(paths_within_workspace_write_carve_out(
+            workspace,
+            &roots,
+            &[shared
+                .path()
+                .join("src/main.rs")
+                .to_string_lossy()
+                .into_owned()],
+        ));
+
+        // A root without a git work tree never qualifies, even for paths
+        // inside it.
+        assert!(!paths_within_workspace_write_carve_out(
+            workspace,
+            &roots,
+            &[no_git
+                .path()
+                .join("src/main.rs")
+                .to_string_lossy()
+                .into_owned()],
+        ));
+
+        // Excluded names stay excluded under every root.
+        assert!(!paths_within_workspace_write_carve_out(
+            workspace,
+            &roots,
+            &[shared.path().join(".env").to_string_lossy().into_owned()],
+        ));
+        assert!(!paths_within_workspace_write_carve_out(
+            workspace,
+            &roots,
+            &[shared
+                .path()
+                .join(".git/config")
+                .to_string_lossy()
+                .into_owned()],
+        ));
     }
 
     #[cfg(unix)]
@@ -784,6 +886,7 @@ mod tests {
         std::os::unix::fs::symlink(outside.path(), tmp.path().join("link")).expect("symlink");
         assert!(!paths_within_workspace_write_carve_out(
             tmp.path(),
+            &[],
             &["link/evil.rs".to_string()]
         ));
         // A symlink that stays inside the workspace is fine.
@@ -791,6 +894,7 @@ mod tests {
             .expect("inner symlink");
         assert!(paths_within_workspace_write_carve_out(
             tmp.path(),
+            &[],
             &["src-link/main.rs".to_string()]
         ));
     }
@@ -801,20 +905,20 @@ mod tests {
         let full_access = authority(AppMode::Agent, true, ApprovalMode::Bypass);
 
         assert_eq!(
-            full_access.sandbox_policy(workspace, None),
+            full_access.sandbox_policy(workspace, &[], None),
             SandboxPolicy::DangerFullAccess
         );
         assert!(matches!(
-            full_access.sandbox_policy(workspace, Some("workspace-write")),
+            full_access.sandbox_policy(workspace, &[], Some("workspace-write")),
             SandboxPolicy::WorkspaceWrite { writable_roots, .. }
                 if writable_roots == vec![workspace.to_path_buf()]
         ));
         assert_eq!(
-            full_access.sandbox_policy(workspace, Some("read-only")),
+            full_access.sandbox_policy(workspace, &[], Some("read-only")),
             SandboxPolicy::ReadOnly
         );
         assert!(matches!(
-            full_access.sandbox_policy(workspace, Some("external-sandbox")),
+            full_access.sandbox_policy(workspace, &[], Some("external-sandbox")),
             SandboxPolicy::ExternalSandbox {
                 network_access: true
             }
@@ -827,14 +931,14 @@ mod tests {
         for approval_mode in [ApprovalMode::Suggest, ApprovalMode::Auto] {
             let authority = authority(AppMode::Agent, false, approval_mode);
             assert!(matches!(
-                authority.sandbox_policy(workspace, Some("danger-full-access")),
+                authority.sandbox_policy(workspace, &[], Some("danger-full-access")),
                 SandboxPolicy::WorkspaceWrite { .. }
             ));
         }
 
         let plan = authority(AppMode::Plan, true, ApprovalMode::Bypass);
         assert_eq!(
-            plan.sandbox_policy(workspace, Some("danger-full-access")),
+            plan.sandbox_policy(workspace, &[], Some("danger-full-access")),
             SandboxPolicy::ReadOnly
         );
     }
