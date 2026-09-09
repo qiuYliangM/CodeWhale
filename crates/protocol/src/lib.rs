@@ -84,6 +84,8 @@ pub struct Thread {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
     pub cwd: PathBuf,
+    #[serde(default)]
+    pub workspace_roots: Vec<PathBuf>,
     pub cli_version: String,
     pub source: SessionSource,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -136,6 +138,8 @@ pub struct ThreadStartParams {
     pub model_provider: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workspace_roots: Vec<PathBuf>,
     #[serde(default)]
     pub persist_extended_history: bool,
 }
@@ -165,6 +169,8 @@ pub struct ThreadResumeParams {
     pub developer_instructions: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub personality: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workspace_roots: Vec<PathBuf>,
     #[serde(default)]
     pub persist_extended_history: bool,
 }
@@ -190,6 +196,8 @@ pub struct ThreadForkParams {
     pub base_instructions: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub developer_instructions: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workspace_roots: Vec<PathBuf>,
     #[serde(default)]
     pub persist_extended_history: bool,
 }
