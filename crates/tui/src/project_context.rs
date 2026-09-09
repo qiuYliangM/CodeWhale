@@ -853,6 +853,12 @@ fn is_source_file(path: &str) -> bool {
 /// Load project context from the workspace directory.
 ///
 /// This searches for known project context files and loads the first one found.
+///
+/// Multi-root sessions (`workspace_roots`) deliberately discover instructions
+/// from the primary root only: additional roots grant filesystem access, not
+/// prompt authority. Widening this scan would inflate the prompt and shift the
+/// KV prefix-cache stable region with the root set, so any change must weigh
+/// that first (see `forkguard_workspace_roots_instructions_stay_primary_root_only`).
 pub fn load_project_context(workspace: &Path) -> ProjectContext {
     let mut ctx = ProjectContext::empty(workspace.to_path_buf());
 
@@ -929,6 +935,9 @@ pub fn load_project_context(workspace: &Path) -> ProjectContext {
 /// Load project context from parent directories as well.
 ///
 /// This allows for monorepo setups where a root AGENTS.md applies to all subdirectories.
+/// The ancestor walk starts at the primary root only — the same multi-root
+/// policy as [`load_project_context`]; additional workspace roots are never
+/// scanned for instructions.
 pub fn load_project_context_with_parents(workspace: &Path) -> ProjectContext {
     load_project_context_for_host(
         workspace,
@@ -1557,6 +1566,46 @@ mod tests {
         assert!(!context.has_instructions());
         assert!(context.constitution_block.is_none());
         assert_eq!(load_repo_law_rules(tmp.path()).len(), 1);
+    }
+
+    #[test]
+    fn forkguard_workspace_roots_instructions_stay_primary_root_only() {
+        // Multi-root sessions grant additional roots filesystem access but
+        // never prompt authority: discovery runs against the primary root
+        // only, so an attached root's AGENTS.md must never enter the injected
+        // block (which would also shift the KV prefix-cache stable region
+        // with the root set).
+        let primary = tempdir().expect("primary root");
+        let attached = tempdir().expect("attached root");
+        fs::write(
+            primary.path().join("AGENTS.md"),
+            "primary-root instructions",
+        )
+        .expect("write primary AGENTS.md");
+        fs::write(
+            attached.path().join("AGENTS.md"),
+            "attached-root instructions that must never load",
+        )
+        .expect("write attached AGENTS.md");
+
+        let with_attached = load_project_context_with_parents_cached_and_home(primary.path(), None);
+        // Byte-for-byte the same context as loading the primary root alone.
+        fs::remove_file(attached.path().join("AGENTS.md")).expect("remove attached AGENTS.md");
+        let without_attached =
+            load_project_context_with_parents_cached_and_home(primary.path(), None);
+
+        assert_eq!(
+            with_attached.instructions, without_attached.instructions,
+            "an attached root must not change the injected instructions"
+        );
+        let instructions = with_attached
+            .instructions
+            .expect("primary instructions load");
+        assert!(instructions.contains("primary-root instructions"));
+        assert!(
+            !instructions.contains("attached-root"),
+            "attached root instructions must never be injected: {instructions}"
+        );
     }
 
     #[test]
