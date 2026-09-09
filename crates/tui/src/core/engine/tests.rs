@@ -12745,6 +12745,8 @@ async fn sync_session_restores_current_mode() {
             system_prompt_override: false,
             model: "deepseek-v4-pro".to_string(),
             workspace: tmp.path().to_path_buf(),
+            workspace_roots: Vec::new(),
+
             mode: AppMode::Plan,
         })
         .await
@@ -12802,6 +12804,8 @@ async fn sync_session_projects_persisted_subagent_handoff_for_headless_restore()
             system_prompt_override: false,
             model: "deepseek-v4-pro".to_string(),
             workspace: tmp.path().to_path_buf(),
+            workspace_roots: Vec::new(),
+
             mode: AppMode::Agent,
         })
         .await
@@ -12937,6 +12941,8 @@ async fn edit_last_turn_preserves_current_mode() {
             system_prompt_override: false,
             model: "deepseek-v4-pro".to_string(),
             workspace: tmp.path().to_path_buf(),
+            workspace_roots: Vec::new(),
+
             mode: AppMode::Agent,
         })
         .await
@@ -13073,6 +13079,8 @@ async fn forkguard_edit_last_turn_cuts_at_user_prompt_before_tool_results() {
             system_prompt_override: false,
             model: "deepseek-v4-pro".to_string(),
             workspace: tmp.path().to_path_buf(),
+            workspace_roots: Vec::new(),
+
             mode: AppMode::Agent,
         })
         .await
@@ -13185,6 +13193,8 @@ async fn forkguard_edit_last_turn_without_user_prompt_errors_and_sends_nothing()
             system_prompt_override: false,
             model: "deepseek-v4-pro".to_string(),
             workspace: tmp.path().to_path_buf(),
+            workspace_roots: Vec::new(),
+
             mode: AppMode::Agent,
         })
         .await
@@ -13287,6 +13297,8 @@ async fn forkguard_edit_last_turn_without_user_prompt_errors_and_sends_nothing()
             system_prompt_override: false,
             model: "deepseek-v4-pro".to_string(),
             workspace: tmp.path().to_path_buf(),
+            workspace_roots: Vec::new(),
+
             mode: AppMode::Agent,
         })
         .await

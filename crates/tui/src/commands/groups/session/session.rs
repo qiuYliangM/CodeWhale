@@ -169,6 +169,8 @@ pub fn fork_from_session(app: &mut App, session_id_or_prefix: &str) -> CommandRe
                 .map(|s| crate::models::SystemPrompt::Text(s.clone())),
             model: forked.metadata.model.clone(),
             workspace: app.workspace.clone(),
+            workspace_roots: forked.metadata.workspace_roots.clone(),
+
             mode: app.mode,
         },
     )
@@ -285,6 +287,8 @@ pub fn fork(app: &mut App) -> CommandResult {
             system_prompt: app.system_prompt.clone(),
             model: app.model.clone(),
             workspace: app.workspace.clone(),
+            workspace_roots: parent.metadata.workspace_roots.clone(),
+
             mode: app.mode,
         },
     )
@@ -344,6 +348,8 @@ pub fn new_session(app: &mut App, arg: Option<&str>) -> CommandResult {
             system_prompt: None,
             model: app.model.clone(),
             workspace: app.workspace.clone(),
+            workspace_roots: Vec::new(),
+
             mode: app.mode,
         },
     )

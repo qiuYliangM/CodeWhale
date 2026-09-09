@@ -2894,6 +2894,7 @@ impl Engine {
                         system_prompt_override,
                         model,
                         workspace,
+                        workspace_roots: _,
                         mode,
                     } => {
                         // The steers queued so far belong to the previous
