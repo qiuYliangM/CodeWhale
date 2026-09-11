@@ -2741,6 +2741,21 @@ mod tests {
     }
 
     #[test]
+    fn forkguard_compaction_reinject_source_is_file_name_not_absolute_path() {
+        // 压缩后逐字重注入的 <project_instructions> 与 as_system_block 同一
+        // 口径:source 只报文件名。压缩块落在重建后的前缀里,绝对路径会在
+        // 目录搬移后击破提供商 KV 前缀缓存。
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("AGENTS.md"), "Pinned compaction content\n").unwrap();
+        let section = project_instructions_section(Some(tmp.path()));
+        assert!(section.contains("<project_instructions source=\"AGENTS.md\">"));
+        assert!(
+            !section.contains(&tmp.path().display().to_string()),
+            "压缩重注入标签不得携带绝对路径: {section}"
+        );
+    }
+
+    #[test]
     fn continuation_block_retains_intent_decisions_evidence_and_inflight_tools() {
         let messages = vec![
             msg(
