@@ -12386,6 +12386,7 @@ fn persist_exec_session(
     model: &str,
     provider_route: PersistedProviderRoute<'_>,
     workspace: &Path,
+    workspace_roots: &[PathBuf],
     system_prompt: &Option<SystemPrompt>,
     session_id: Option<&str>,
     total_tokens: u64,
@@ -12429,6 +12430,7 @@ fn persist_exec_session(
         provider_route.kind,
         provider_route.id,
         workspace,
+        workspace_roots,
     );
     let id = saved.metadata.id.clone();
     manager
@@ -12443,12 +12445,14 @@ fn stamp_exec_session_metadata(
     model_provider_kind: &str,
     model_provider_id: Option<&str>,
     workspace: &Path,
+    workspace_roots: &[PathBuf],
 ) {
     saved.metadata.model = model.to_string();
     saved
         .metadata
         .set_model_provider_route(model_provider_kind, model_provider_id);
     saved.metadata.workspace = workspace.to_path_buf();
+    saved.metadata.workspace_roots = workspace_roots.to_vec();
     saved.metadata.mode = Some("exec".to_string());
 }
 
@@ -16275,6 +16279,7 @@ api_key = "test-only-key"
             crate::config::ApiProvider::Custom.as_str(),
             Some("custom-b"),
             Path::new("/tmp/exec-resume"),
+            &[PathBuf::from("/tmp/exec-resume-shared")],
         );
 
         let mut next_config = custom_exec_config("custom-a");
@@ -16307,6 +16312,7 @@ api_key = "test-only-key"
             crate::config::ApiProvider::Custom.as_str(),
             None,
             Path::new("/tmp/exec-root"),
+            &[],
         );
 
         assert_eq!(saved.metadata.model_provider, "custom");
