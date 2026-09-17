@@ -15857,7 +15857,6 @@ async fn sync_session_restores_current_mode() {
             model: "deepseek-v4-pro".to_string(),
             workspace: tmp.path().to_path_buf(),
             workspace_roots: Vec::new(),
-
             mode: AppMode::Plan,
         })
         .await
@@ -15937,7 +15936,6 @@ async fn sync_session_without_prompt_repins_full_system_prompt_on_next_turn() {
             model: crate::config::DEFAULT_TEXT_MODEL.to_string(),
             workspace: workspace.path().to_path_buf(),
             workspace_roots: Vec::new(),
-
             mode: AppMode::Agent,
         })
         .await
@@ -16020,7 +16018,6 @@ async fn sync_session_same_id_does_not_finalize_live_worker() {
             model: "deepseek-v4-pro".to_string(),
             workspace: workspace.clone(),
             workspace_roots: Vec::new(),
-
             mode: AppMode::Agent,
         })
         .await
@@ -16042,7 +16039,6 @@ async fn sync_session_same_id_does_not_finalize_live_worker() {
             model: "deepseek-v4-pro".to_string(),
             workspace: workspace.clone(),
             workspace_roots: Vec::new(),
-
             mode: AppMode::Agent,
         })
         .await
@@ -16085,7 +16081,6 @@ async fn sync_session_different_id_finalizes_live_worker() {
             model: "deepseek-v4-pro".to_string(),
             workspace: workspace.clone(),
             workspace_roots: Vec::new(),
-
             mode: AppMode::Agent,
         })
         .await
@@ -16110,7 +16105,6 @@ async fn sync_session_different_id_finalizes_live_worker() {
             model: "deepseek-v4-pro".to_string(),
             workspace: workspace.clone(),
             workspace_roots: Vec::new(),
-
             mode: AppMode::Agent,
         })
         .await
@@ -16178,7 +16172,6 @@ async fn sync_session_migrates_one_checkpoint_and_strips_its_system_carrier() {
                 model: "deepseek-v4-pro".to_string(),
                 workspace: tmp.path().to_path_buf(),
                 workspace_roots: Vec::new(),
-
                 mode: AppMode::Agent,
             })
             .await
@@ -16263,7 +16256,6 @@ async fn sync_session_projects_persisted_subagent_handoff_for_headless_restore()
             model: "deepseek-v4-pro".to_string(),
             workspace: tmp.path().to_path_buf(),
             workspace_roots: Vec::new(),
-
             mode: AppMode::Agent,
         })
         .await
@@ -16501,7 +16493,6 @@ async fn edit_last_turn_preserves_current_mode() {
             model: "deepseek-v4-pro".to_string(),
             workspace: tmp.path().to_path_buf(),
             workspace_roots: Vec::new(),
-
             mode: AppMode::Agent,
         })
         .await
@@ -16660,7 +16651,6 @@ async fn edit_last_turn_cuts_at_user_prompt_before_tool_results() {
             model: "deepseek-v4-pro".to_string(),
             workspace: tmp.path().to_path_buf(),
             workspace_roots: Vec::new(),
-
             mode: AppMode::Agent,
         })
         .await
@@ -16775,7 +16765,6 @@ async fn edit_last_turn_without_user_prompt_errors_and_sends_nothing() {
             model: "deepseek-v4-pro".to_string(),
             workspace: tmp.path().to_path_buf(),
             workspace_roots: Vec::new(),
-
             mode: AppMode::Agent,
         })
         .await
@@ -16880,7 +16869,6 @@ async fn edit_last_turn_without_user_prompt_errors_and_sends_nothing() {
             model: "deepseek-v4-pro".to_string(),
             workspace: tmp.path().to_path_buf(),
             workspace_roots: Vec::new(),
-
             mode: AppMode::Agent,
         })
         .await
