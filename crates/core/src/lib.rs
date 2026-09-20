@@ -765,12 +765,9 @@ impl ThreadManager {
 
     /// Forks an existing thread into a new one, inheriting the parent's
     /// provider and — when the request does not carry a root set — its
-    /// accessible roots.
-    pub fn fork_thread(
-        &mut self,
-        params: &ThreadForkParams,
-        fallback_cwd: &Path,
-    ) -> Result<Option<NewThread>> {
+    /// accessible roots. A fork without a `cwd` stays anchored at the
+    /// parent's cwd.
+    pub fn fork_thread(&mut self, params: &ThreadForkParams) -> Result<Option<NewThread>> {
         let parent = self.store.get_thread(&params.thread_id)?;
         let Some(parent) = parent else {
             return Ok(None);
@@ -796,10 +793,13 @@ impl ThreadManager {
                 .model_provider
                 .clone()
                 .unwrap_or_else(|| parent_thread.model_provider.clone()),
+            // A bare `thread/fork` carries no cwd: anchor the fork at the
+            // parent's cwd, not the process cwd, so the parent's main
+            // directory stays the primary root of the set it inherits.
             params
                 .cwd
                 .clone()
-                .unwrap_or_else(|| fallback_cwd.to_path_buf()),
+                .unwrap_or_else(|| parent_thread.cwd.clone()),
             &workspace_roots,
             InitialHistory::Forked(vec![json!({
                 "type": "fork",
@@ -1182,8 +1182,7 @@ impl Runtime {
                 }
             }
             ThreadRequest::Fork(params) => {
-                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                if let Some(new) = self.thread_manager.fork_thread(&params, &cwd)? {
+                if let Some(new) = self.thread_manager.fork_thread(&params)? {
                     let mut response = thread_response_from_new("forked", new);
                     response.data = self.persisted_thread_data(&response.thread_id)?;
                     Ok(response)
@@ -3629,12 +3628,14 @@ mod tests {
     fn fork_without_roots_inherits_the_parent_set() {
         let mut manager = seed_multi_root_parent("fork-roots-inherit");
         let forked = manager
-            .fork_thread(&fork_params("thread-parent"), Path::new("/repo/main"))
+            .fork_thread(&fork_params("thread-parent"))
             .expect("fork thread")
             .expect("parent found");
 
         // The historical bare `thread/fork` shape: the parent record is the
-        // only source of the set, so an absent field must inherit it.
+        // only source of the set, so an absent field must inherit it — and an
+        // absent cwd keeps the parent's cwd as primary rather than
+        // re-anchoring the set under the process cwd.
         assert_eq!(forked.thread.cwd, PathBuf::from("/repo/main"));
         assert_eq!(
             forked.thread.workspace_roots,
@@ -3655,7 +3656,7 @@ mod tests {
         params.cwd = Some(PathBuf::from("/repo/topic"));
 
         let forked = manager
-            .fork_thread(&params, Path::new("/repo/main"))
+            .fork_thread(&params)
             .expect("fork thread")
             .expect("parent found");
 
@@ -3675,7 +3676,7 @@ mod tests {
         params.workspace_roots = Some(Vec::new());
 
         let forked = manager
-            .fork_thread(&params, Path::new("/repo/main"))
+            .fork_thread(&params)
             .expect("fork thread")
             .expect("parent found");
 
