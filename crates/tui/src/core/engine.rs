@@ -8153,8 +8153,9 @@ pub(crate) fn exec_shell_ask_rule_decision_for_policy(
     // judgment canonicalizes the same way: the lexical join alone let
     // `link/..` normalize back into the primary while execution landed in
     // the symlink target, firing a primary-scoped allow across the boundary
-    // (review #484/CodeWhale round-20 B20-1). A nonexistent operand keeps
-    // the lexical join, matching resolve_nonexistent_path's behavior.
+    // (review #484/CodeWhale round-20 B20-1). A nonexistent operand
+    // resolves through the deepest existing ancestor (symlinks included),
+    // matching resolve_nonexistent_path's behavior (round-21 B21-3).
     let effective_cwd = ["cwd", "working_dir"]
         .iter()
         .find_map(|name| tool_input.get(name).and_then(Value::as_str))
@@ -8165,9 +8166,40 @@ pub(crate) fn exec_shell_ask_rule_decision_for_policy(
             } else {
                 workspace.join(raw)
             };
-            joined
-                .canonicalize()
-                .unwrap_or_else(|_| crate::tools::spec::normalize_path(&joined))
+            match joined.canonicalize() {
+                Ok(canonical) => canonical,
+                // Round-21 B21-3: a nonexistent operand mirrors
+                // `resolve_nonexistent_path` — walk LEXICALLY to the deepest
+                // existing ancestor (keeping the popped tail, trailing `..`
+                // included), canonicalize it through any symlink, re-append
+                // the tail and normalize. Keeping the plain lexical join here
+                // recreated the round-20 bypass one layer deeper under
+                // `workspace_follow_symlinks` (`link/<absent>/../..` judged
+                // as the primary while execution landed in the link target).
+                Err(_) => {
+                    let mut ancestor = joined.clone();
+                    let mut suffix: Vec<std::ffi::OsString> = Vec::new();
+                    loop {
+                        if ancestor.exists() {
+                            break;
+                        }
+                        if let Some(name) = ancestor.file_name() {
+                            suffix.push(name.to_owned());
+                        }
+                        match ancestor.parent() {
+                            Some(parent) if !parent.as_os_str().is_empty() => {
+                                ancestor = parent.to_path_buf();
+                            }
+                            _ => break,
+                        }
+                    }
+                    let mut resolved = ancestor.canonicalize().unwrap_or_else(|_| ancestor.clone());
+                    for part in suffix.iter().rev() {
+                        resolved.push(part);
+                    }
+                    crate::tools::spec::normalize_path(&resolved)
+                }
+            }
         });
     tool_ask_rule_decision_for_context(
         exec_policy_engine,

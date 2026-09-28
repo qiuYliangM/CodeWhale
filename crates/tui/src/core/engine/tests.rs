@@ -26890,3 +26890,49 @@ fn exec_judged_cwd_resolves_symlinks_like_execution() {
         Some(ToolAskRuleDecision::Allow)
     );
 }
+
+// Round-21 B21-3 absent-interior leg: a nonexistent component behind the
+// link used to keep the lexical join (normalize pops `absent/..` and
+// `link/..` back onto the primary) while execution's
+// resolve_nonexistent_path canonicalizes the deepest existing ancestor —
+// the link — landing in the attached repo.
+#[test]
+#[cfg(unix)]
+fn exec_judged_cwd_resolves_absent_interior_behind_symlink() {
+    use std::path::Path;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let primary_raw = temp.path().join("ws");
+    let attached_raw = temp.path().join("attached").join("repo");
+    std::fs::create_dir_all(&primary_raw).unwrap();
+    std::fs::create_dir_all(&attached_raw).unwrap();
+    let primary = std::fs::canonicalize(&primary_raw).unwrap();
+    let attached = std::fs::canonicalize(&attached_raw).unwrap();
+    std::os::unix::fs::symlink(&attached, primary_raw.join("link")).unwrap();
+
+    let rule = codewhale_execpolicy::ToolAskRule::exec_shell("git push")
+        .into_exact_workspace_allow(primary.to_string_lossy().as_ref());
+    let config = EngineConfig {
+        exec_policy_engine: codewhale_execpolicy::ExecPolicyEngine::with_rulesets(vec![
+            codewhale_execpolicy::Ruleset::user(vec![], vec![]).with_ask_rules(vec![rule]),
+        ]),
+        ..EngineConfig::default()
+    };
+    let roots = [attached];
+
+    // The `link/<absent>/../..` spelling: the lexical join pops back onto
+    // the primary; the deepest-existing resolution (what execution's
+    // resolve_nonexistent_path does) lands in the attached repo through
+    // the link. The primary-scoped allow must not fire.
+    assert_ne!(
+        exec_shell_ask_rule_decision(
+            &config,
+            "exec_shell",
+            &json!({"command": "git push", "cwd": "link/absent/../.."}),
+            Path::new(&primary),
+            &roots,
+            crate::tui::approval::ApprovalMode::Suggest,
+        ),
+        Some(ToolAskRuleDecision::Allow)
+    );
+}

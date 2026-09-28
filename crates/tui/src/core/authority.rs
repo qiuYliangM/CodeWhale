@@ -604,7 +604,7 @@ fn carve_out_target_allowed(workspace: &Path, workspace_canonical: &Path, raw: &
 /// Canonicalize the deepest existing ancestor of `candidate` and re-append
 /// the not-yet-existing tail, so write targets that do not exist yet still
 /// get a real-path check.
-fn resolve_deepest_existing(candidate: &Path) -> Option<PathBuf> {
+pub(crate) fn resolve_deepest_existing(candidate: &Path) -> Option<PathBuf> {
     let mut ancestor = candidate;
     let mut suffix: Vec<&OsStr> = Vec::new();
     loop {

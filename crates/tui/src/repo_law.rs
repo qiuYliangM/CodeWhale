@@ -18,7 +18,6 @@
 //! - Only the repo-local constitution participates. The user-global
 //!   constitution stays advisory prose and never reaches this module.
 
-use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -304,7 +303,7 @@ fn push_normalized(
     // judge the resolved path against the canonical root, so an interior
     // symlink hop into this root (or a root reached through one) cannot
     // spell its way past the law.
-    if let Some(resolved) = resolve_deepest_existing(&candidate)
+    if let Some(resolved) = crate::core::authority::resolve_deepest_existing(&candidate)
         && let Ok(tail) = resolved.strip_prefix(root_canonical)
     {
         let tail = tail.to_string_lossy().replace('\\', "/");
@@ -328,26 +327,6 @@ fn push_normalized(
 /// relative spelling cannot pop is kept, again matching execution.
 fn normalize_lexical_components(path: &Path) -> PathBuf {
     crate::tools::spec::normalize_path(path)
-}
-
-/// Canonicalize the deepest existing ancestor of `candidate` and re-append
-/// the not-yet-existing tail, so write targets that do not exist yet still
-/// get a real-path check. Mirrors `core::authority::resolve_deepest_existing`
-/// (private there); `None` when no ancestor resolves.
-fn resolve_deepest_existing(candidate: &Path) -> Option<PathBuf> {
-    let mut ancestor = candidate;
-    let mut suffix: Vec<&OsStr> = Vec::new();
-    loop {
-        if let Ok(canonical) = ancestor.canonicalize() {
-            let mut resolved = canonical;
-            for part in suffix.iter().rev() {
-                resolved.push(part);
-            }
-            return Some(resolved);
-        }
-        suffix.push(ancestor.file_name()?);
-        ancestor = ancestor.parent()?;
-    }
 }
 
 #[cfg(test)]
