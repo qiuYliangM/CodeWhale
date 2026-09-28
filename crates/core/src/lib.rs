@@ -89,6 +89,13 @@ pub enum InitialHistory {
 /// survive here. Callers that enumerate writable roots canonicalize per root
 /// for exactly that reason; a future canonicalizing intake would remove the
 /// residue, at the cost of filesystem access on every normalization.
+///
+/// This function stays a *shape* normalizer, not a validator, because it also
+/// runs on sets that never passed an intake surface (restored sessions, legacy
+/// or hand-edited records): those degrade by dropping the meaningless entries
+/// rather than failing the whole load. Intake surfaces that receive a
+/// caller-declared set route through [`validate_workspace_roots`] instead,
+/// which rejects rather than drops.
 pub fn normalize_workspace_roots(cwd: &Path, roots: &[PathBuf]) -> Vec<PathBuf> {
     if cwd.as_os_str().is_empty() || !cwd.is_absolute() {
         return Vec::new();
@@ -105,6 +112,94 @@ pub fn normalize_workspace_roots(cwd: &Path, roots: &[PathBuf]) -> Vec<PathBuf> 
     normalized
 }
 
+/// Intake validation for a caller-declared root set: admit it whole or reject
+/// it with an error, never silently reshape it.
+///
+/// The per-turn sandbox copies this set verbatim into
+/// `WorkspaceWrite.writable_roots`, so three classes of declared entry widen
+/// the boundary past anything the caller saw, and each is rejected here:
+///
+/// - a non-absolute root (`~/shared`, `relative/dir`) is meaningless against
+///   the absolute candidates every containment check resolves —
+///   [`normalize_workspace_roots`] would silently drop it, shrinking the
+///   declared set without telling the caller, so intake refuses it instead;
+/// - a root that normalizes to the filesystem root (`/`, `/..`) makes the
+///   sandboxed exec lane filesystem-writable in one attachment;
+/// - a root that is a proper ancestor of the primary root (the primary's
+///   parent) grants the same reach one spelling at a time.
+///
+/// `..` spellings are caught by the same lexical normalization the landing
+/// checks apply, so `/shared/..` rejects exactly where `/` does. A root that
+/// merely lives *under* the primary is fine — it is already writable through
+/// the primary — and a root equal to the primary dedups in
+/// [`normalize_workspace_roots`].
+///
+/// The degenerate primary keeps the normalizer's fail-closed collapse rather
+/// than an error: an empty or relative primary cannot head a root set (its
+/// normalized form is the vacuous root), which is the round-17 decision the
+/// intake surfaces already pin — an empty workspace is rejected outright
+/// there, and this collapse is the last line for values that bypass a
+/// surface.
+pub fn validate_workspace_roots(cwd: &Path, roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    if cwd.as_os_str().is_empty() || !cwd.is_absolute() {
+        return Ok(Vec::new());
+    }
+    let primary = normalize_lexical_components(cwd);
+    for root in roots {
+        if root.as_os_str().is_empty() || !root.is_absolute() {
+            return Err(anyhow!(
+                "workspace root must be an absolute path; got {root:?}"
+            ));
+        }
+        let normalized = normalize_lexical_components(root);
+        if is_filesystem_root(&normalized) {
+            return Err(anyhow!(
+                "workspace root {root:?} normalizes to the filesystem root; \
+                 attaching it would make the whole filesystem writable"
+            ));
+        }
+        if primary != normalized && primary.starts_with(&normalized) {
+            return Err(anyhow!(
+                "workspace root {root:?} contains the primary root {cwd:?}; \
+                 attaching an ancestor of the primary would widen the sandbox \
+                 past the primary"
+            ));
+        }
+    }
+    Ok(normalize_workspace_roots(cwd, roots))
+}
+
+/// Lexically collapse CurDir and ParentDir components of `path`, clamping a
+/// `..` at the filesystem root rather than failing: `/a/..` judges as `/`,
+/// the path the filesystem would actually resolve. Comparison-local, so a
+/// self-consistent collapse of the two sides is exactly what the root-vs-root
+/// checks need; the landing-path normalizer execution uses lives behind the
+/// tool boundary and stays there.
+fn normalize_lexical_components(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    normalized
+}
+
+/// True when `path` is a filesystem root — no named component left after
+/// normalization (`/`, a Windows drive root, or a `..`-clamped spelling of
+/// either).
+fn is_filesystem_root(path: &Path) -> bool {
+    !path
+        .components()
+        .any(|component| matches!(component, std::path::Component::Normal(_)))
+}
+
 /// Resolves the cwd and workspace roots for a resume request, aligned with
 /// codex semantics: an explicit root set replaces the whole set (`Some([])`
 /// clears back to the bare cwd); an explicit cwd alone takes over the
@@ -112,6 +207,13 @@ pub fn normalize_workspace_roots(cwd: &Path, roots: &[PathBuf]) -> Vec<PathBuf> 
 /// the persisted values. An explicit empty cwd is rejected, not defaulted:
 /// persisting it would null containment on every later resume, the same
 /// poison the intake filter drops from the roots list.
+///
+/// A caller-declared replacement set goes through
+/// [`validate_workspace_roots`], so a super-root or an ancestor of the
+/// primary is rejected here rather than admitted into the persisted row.
+/// Branches that only re-shape *persisted* values keep the tolerant
+/// normalizer: a legacy or hand-edited row must stay loadable, not strand
+/// its owner at resume time.
 fn resolve_resume_roots(
     persisted_cwd: &Path,
     persisted_roots: &[PathBuf],
@@ -128,8 +230,10 @@ fn resolve_resume_roots(
             .cloned()
             .unwrap_or_else(|| persisted_cwd.to_path_buf());
         // An explicit set replaces the persisted one wholesale — including
-        // the explicit empty set, which clears back to the bare cwd.
-        let roots = normalize_workspace_roots(&cwd, roots);
+        // the explicit empty set, which clears back to the bare cwd. The
+        // replacement is a caller decision, so it validates instead of
+        // degrading: a super-root must not slip in through the resume lane.
+        let roots = validate_workspace_roots(&cwd, roots)?;
         return Ok((cwd, roots));
     }
     if let Some(new_cwd) = params_cwd {
@@ -631,7 +735,10 @@ impl ThreadManager {
         let id = format!("thread-{}", Uuid::new_v4());
         let now = chrono::Utc::now().timestamp();
         let preview = preview_from_initial_history(&initial_history);
-        let workspace_roots = normalize_workspace_roots(&cwd, workspace_roots);
+        // Caller-declared set: validate, don't degrade. A super-root, an
+        // ancestor of the primary, or a non-absolute entry is an error, not
+        // a silent reshape of what the caller asked for.
+        let workspace_roots = validate_workspace_roots(&cwd, workspace_roots)?;
         let source = match initial_history {
             InitialHistory::New => SessionSource::Interactive,
             InitialHistory::Forked(_) => SessionSource::Fork,
@@ -3567,36 +3674,128 @@ mod tests {
     }
 
     #[test]
-    fn spawn_thread_with_empty_root_persists_only_the_cwd() {
-        // Regression pin: an empty-string root accepted at intake used to
-        // reach the persisted set and then boundary_roots(), where
+    fn spawn_thread_rejects_a_non_absolute_root_instead_of_dropping_it() {
+        // Regression pin, round-17: an empty-string root accepted at intake
+        // used to reach the persisted set and then boundary_roots(), where
         // Path::starts_with("") is true for every path — read_file's
-        // containment check passed for arbitrary filesystem reads.
+        // containment check passed for arbitrary filesystem reads. Round-19
+        // tightened the decision from "silently drop the entry" to "reject
+        // the declared set": a silent drop shrinks the set the caller asked
+        // for without telling it, and `~/shared` dies by the same rule.
         let store = temp_core_state("spawn-empty-root");
         let mut manager = ThreadManager::new(store);
+        for root in ["", "~/shared", "relative/dir"] {
+            let err = manager
+                .spawn_thread_with_history(
+                    "deepseek".to_string(),
+                    PathBuf::from("/repo/main"),
+                    &[PathBuf::from(root)],
+                    InitialHistory::New,
+                    true,
+                )
+                .expect_err("a non-absolute root must be rejected at intake");
+            assert!(
+                err.to_string().contains("absolute path"),
+                "unexpected error for {root:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn spawn_thread_rejects_a_super_root_and_the_primarys_ancestor() {
+        // Round-19: the per-turn sandbox copies the set verbatim into
+        // WorkspaceWrite.writable_roots, so attaching `/` (or `/..`, which
+        // normalizes to it) made the sandboxed exec lane filesystem-writable,
+        // and the primary's parent granted the same reach one spelling at a
+        // time. Both are rejected at intake now; a sibling still attaches.
+        let store = temp_core_state("spawn-super-root");
+        let mut manager = ThreadManager::new(store);
+        for root in ["/", "/..", "/shared/..", "/repo"] {
+            let err = manager
+                .spawn_thread_with_history(
+                    "deepseek".to_string(),
+                    PathBuf::from("/repo/main"),
+                    &[PathBuf::from(root)],
+                    InitialHistory::New,
+                    true,
+                )
+                .expect_err("a super-root or ancestor must be rejected at intake");
+            assert!(
+                err.to_string().contains("filesystem root")
+                    || err.to_string().contains("ancestor of the primary"),
+                "unexpected error for {root:?}: {err}"
+            );
+        }
         let spawned = manager
             .spawn_thread_with_history(
                 "deepseek".to_string(),
                 PathBuf::from("/repo/main"),
-                &[PathBuf::from("")],
+                &[
+                    PathBuf::from("/repo/lib"),
+                    PathBuf::from("/repo/main/crates"),
+                ],
                 InitialHistory::New,
                 true,
             )
-            .expect("spawn thread");
+            .expect("a sibling and a subdirectory of the primary are fine");
         assert_eq!(
             spawned.thread.workspace_roots,
-            vec![PathBuf::from("/repo/main")]
+            vec![
+                PathBuf::from("/repo/main"),
+                PathBuf::from("/repo/lib"),
+                PathBuf::from("/repo/main/crates"),
+            ]
+        );
+    }
+
+    #[test]
+    fn validate_workspace_roots_keeps_the_degenerate_primary_collapse() {
+        // Round-17 decision, unchanged: an empty or relative primary cannot
+        // head a root set, so the set collapses to empty — the intake
+        // surfaces reject an empty workspace outright; this is the last line
+        // for values that bypass a surface.
+        assert!(
+            validate_workspace_roots(Path::new(""), &[PathBuf::from("/")])
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            validate_workspace_roots(Path::new("relative/dir"), &[])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn resume_with_a_super_root_set_is_rejected_at_intake() {
+        let store = temp_core_state("resume-super-root");
+        let mut metadata = test_thread_metadata("thread-super-root");
+        metadata.cwd = PathBuf::from("/old");
+        metadata.workspace_roots = vec![PathBuf::from("/old")];
+        store.upsert_thread(&metadata).expect("seed thread");
+        let mut manager = ThreadManager::new(store);
+
+        let mut params = resume_params("thread-super-root");
+        params.workspace_roots = Some(vec![PathBuf::from("/..")]);
+        let err = manager
+            .resume_thread_with_history(&params, "deepseek".to_string())
+            .expect_err("an explicit super-root replacement must be rejected");
+        assert!(
+            err.to_string().contains("filesystem root"),
+            "unexpected error: {err}"
         );
 
-        let persisted = manager
-            .state_store()
-            .get_thread(&spawned.thread.id)
-            .expect("read thread")
-            .expect("thread persisted");
+        // The persisted row is untouched: the caller can retry with a real
+        // set, and a parameterless resume still loads the stored one.
+        let mut params = resume_params("thread-super-root");
+        params.workspace_roots = Some(vec![PathBuf::from("/new-a")]);
+        let resumed = manager
+            .resume_thread_with_history(&params, "deepseek".to_string())
+            .expect("resume thread")
+            .expect("thread found");
         assert_eq!(
-            persisted.workspace_roots,
-            vec![PathBuf::from("/repo/main")],
-            "the poison entry must not reach the persisted root set"
+            resumed.thread.workspace_roots,
+            vec![PathBuf::from("/old"), PathBuf::from("/new-a")]
         );
     }
 

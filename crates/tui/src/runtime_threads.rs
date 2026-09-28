@@ -5454,8 +5454,14 @@ impl RuntimeThreadManager {
         let trust_mode = req.trust_mode.unwrap_or(false);
         let auto_approve = policy.auto_approve();
 
+        // The declared set is validated at intake, not silently reshaped: a
+        // super-root (`/`, `/..`), an ancestor of the primary, or a
+        // non-absolute entry (`~/shared`) each widens — or silently shrinks —
+        // the sandbox the caller thinks it declared. The primary slot was
+        // already guarded non-empty above; validation also requires it to be
+        // absolute, since every containment check resolves absolute paths.
         let workspace_roots =
-            codewhale_core::normalize_workspace_roots(&workspace, &req.workspace_roots);
+            codewhale_core::validate_workspace_roots(&workspace, &req.workspace_roots)?;
         let thread = ThreadRecord {
             schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
             id: format!("thr_{}", &Uuid::new_v4().to_string()[..8]),
@@ -5857,11 +5863,14 @@ impl RuntimeThreadManager {
             if let Some(roots) = req.workspace_roots {
                 // Explicit roots replace the whole set, normalized with the
                 // (possibly also-updated) workspace as the primary root.
+                // Caller-declared: validate instead of silently reshaping —
+                // the same super-root/ancestor/non-absolute rejections the
+                // create lane applies.
                 let primary = req
                     .workspace
                     .clone()
                     .unwrap_or_else(|| thread.workspace.clone());
-                let normalized = codewhale_core::normalize_workspace_roots(&primary, &roots);
+                let normalized = codewhale_core::validate_workspace_roots(&primary, &roots)?;
                 if thread.workspace_roots != normalized {
                     changes.insert("workspace_roots".to_string(), json!(normalized));
                     thread.workspace_roots = normalized;
@@ -5873,7 +5882,11 @@ impl RuntimeThreadManager {
                 changes.insert("workspace".to_string(), json!(workspace));
                 if !changes.contains_key("workspace_roots") {
                     // A workspace-only change keeps the additional roots and
-                    // hands the primary slot to the new workspace.
+                    // hands the primary slot to the new workspace. The moved
+                    // primary re-declares the set: an additional root that
+                    // would end up an ancestor of the new primary (or a
+                    // super-root inherited from a legacy row) is a widening
+                    // decision and is rejected, not admitted silently.
                     let additional: Vec<PathBuf> = thread
                         .workspace_roots
                         .iter()
@@ -5881,7 +5894,7 @@ impl RuntimeThreadManager {
                         .cloned()
                         .collect();
                     let normalized =
-                        codewhale_core::normalize_workspace_roots(&workspace, &additional);
+                        codewhale_core::validate_workspace_roots(&workspace, &additional)?;
                     if thread.workspace_roots != normalized {
                         changes.insert("workspace_roots".to_string(), json!(normalized));
                         thread.workspace_roots = normalized;

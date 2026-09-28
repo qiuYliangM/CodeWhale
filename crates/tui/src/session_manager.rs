@@ -312,11 +312,16 @@ pub enum SessionMutator {
 /// release the previous claim in the same step — otherwise a `/new` would
 /// leave the old id permanently locked against the dashboard.
 pub fn set_live_session(session_id: Option<&str>) {
-    if let Ok(mut live) = live_sessions().write() {
-        live.clear();
-        if let Some(id) = session_id.map(str::trim).filter(|id| !id.is_empty()) {
-            live.insert(id.to_string());
-        }
+    // Recover a poisoned write lock rather than dropping the claim: a lost
+    // claim unblocks external writers against a session that may still
+    // autosave, and the wholesale clear below makes any stale content moot.
+    let mut live = match live_sessions().write() {
+        Ok(live) => live,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    live.clear();
+    if let Some(id) = session_id.map(str::trim).filter(|id| !id.is_empty()) {
+        live.insert(id.to_string());
     }
 }
 
@@ -340,11 +345,21 @@ fn is_session_uuid(name: &str) -> bool {
 ///
 /// The registry is process-local. Reclamation must not treat a missing entry
 /// here as proof that no other Codewhale process still owns the directory.
+///
+/// The query is judged against the trimmed id, the same normalized value
+/// `set_live_session` stores: every store path trims (`validated_session_id`),
+/// so an exact match on the raw string would let a padded id (`" sess-… "`)
+/// slip past the live-session conflict and overwrite the live owner's
+/// document. A poisoned lock means ownership cannot be determined, so the
+/// answer fails closed: treat the session as live and make external writers
+/// take the conflict, rather than race an autosave nobody can see.
 #[must_use]
 pub fn is_live_session(session_id: &str) -> bool {
+    let trimmed = session_id.trim();
     live_sessions()
         .read()
-        .is_ok_and(|live| live.contains(session_id))
+        .map(|live| live.contains(trimmed))
+        .unwrap_or(true)
 }
 
 /// The error an external writer gets when the session is live.
@@ -5003,5 +5018,55 @@ mod tests {
             err.to_string().contains("newer than supported"),
             "unexpected error: {err}"
         );
+    }
+
+    /// The live-session claim is judged on the trimmed id — the same
+    /// normalized value `set_live_session` stores — so a padded id cannot
+    /// read as a stranger to the guard while every store path
+    /// (`validated_session_id`) reads it as the owner.
+    #[test]
+    fn live_session_claim_matches_the_trimmed_query() {
+        let _lock = crate::shell_dispatcher::test_env_lock::lock_test_env();
+        set_live_session(Some("  sess-pad  "));
+        assert!(is_live_session("sess-pad"));
+        assert!(
+            is_live_session("  sess-pad  "),
+            "a padded id must hit the claim the trimmed id would hit"
+        );
+        assert!(!is_live_session("sess-other"));
+        set_live_session(None);
+        assert!(!is_live_session("  sess-pad  "));
+    }
+
+    /// A poisoned claim lock means ownership cannot be determined, so the
+    /// answer fails closed: the session counts as live and external writers
+    /// take the conflict instead of racing an autosave nobody can see.
+    #[test]
+    fn live_session_claim_fails_closed_on_a_poisoned_lock() {
+        let _lock = crate::shell_dispatcher::test_env_lock::lock_test_env();
+        set_live_session(Some("sess-poison"));
+        // Poison the lock by panicking while holding its write guard, then
+        // clear the poison in the same test — the process-global lock is
+        // shared with every other test in this binary, and only the env lock
+        // above keeps the poisoned window single-threaded.
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = live_sessions().write();
+            panic!("poison the live-session claim lock");
+        });
+        assert!(
+            live_sessions().read().is_err(),
+            "the lock must actually be poisoned for this pin to mean anything"
+        );
+        assert!(
+            is_live_session("sess-poison"),
+            "poisoned: the known claim must still read as live"
+        );
+        assert!(
+            is_live_session("sess-unknown"),
+            "poisoned: an unknown id must also read as live (fail closed)"
+        );
+        live_sessions().clear_poison();
+        set_live_session(None);
+        assert!(!is_live_session("sess-unknown"));
     }
 }

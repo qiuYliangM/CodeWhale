@@ -618,6 +618,19 @@ take no request body: both always inherit the thread's stored set, and a
 client posting `workspace_roots` to either gets plain inheritance — reshape
 through `PATCH` instead.
 
+Resuming or forking a thread id that does not exist answers `404 Not Found`
+(the stdio `thread/resume` / `thread/fork` methods answer the typed
+`thread_not_found` error, `-32004`) instead of a success envelope carrying
+`status: "missing"`, so a stale id no longer hides behind a 200. Declared
+`workspace_roots` are validated at intake rather than silently reshaped: a
+root that is not an absolute path (a `~/shared` spelling is refused, not
+dropped), a root that normalizes to the filesystem root (`/`, `/..`), and a
+root that is an ancestor of the primary workspace (its parent directory)
+all answer `400 Bad Request` with the reason — each of those would widen
+the per-turn sandbox past what the request declared. A root that sits under
+the primary is accepted, and an explicit empty array still clears back to
+the bare workspace.
+
 `reasoning_effort` uses the canonical Runtime vocabulary (`auto`, `off`,
 `low`, `medium`, `high`, `xhigh`, `ultra`, or `max`; documented compatibility
 aliases are accepted and persisted canonically). `allowed_tools` is a

@@ -4621,6 +4621,111 @@ async fn session_resave_after_workspace_move_keeps_workspace_and_roots_paired() 
     Ok(())
 }
 
+/// Declared root sets are validated at intake, not silently reshaped. The
+/// per-turn sandbox copies the set into `WorkspaceWrite.writable_roots`
+/// verbatim, so attaching `/` (or `/..`, or the workspace's parent — the
+/// same reach one spelling at a time) would make the sandboxed exec lane
+/// filesystem-writable, and a non-absolute entry like `~/shared` used to be
+/// silently dropped, shrinking the declared set without a word. All four are
+/// rejected now; a normal sibling root still attaches.
+#[tokio::test]
+async fn thread_create_rejects_super_root_ancestor_and_non_absolute_roots() -> Result<()> {
+    let root = std::env::temp_dir().join(format!("deepseek-thread-root-intake-{}", Uuid::new_v4()));
+    let sessions_dir = root.join("sessions");
+    let workspace = root.join("workspace");
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_root_token_mobile_workspace(
+            root.clone(),
+            sessions_dir,
+            None,
+            false,
+            workspace.clone(),
+        )
+        .await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    // The filesystem root, in the spelling a client would type and in the
+    // `..` spelling that normalizes to it.
+    for declared in ["/", "/.."] {
+        let rejected = client
+            .post(format!("http://{addr}/v1/threads"))
+            .json(&json!({ "workspace_roots": [declared] }))
+            .send()
+            .await?;
+        assert_eq!(
+            rejected.status(),
+            StatusCode::BAD_REQUEST,
+            "attaching {declared:?} must be rejected at intake"
+        );
+    }
+
+    // The workspace's parent contains the primary: the same widening, one
+    // spelling at a time.
+    let parent = workspace
+        .parent()
+        .and_then(|dir| dir.to_str())
+        .context("test workspace must have a parent")?
+        .to_string();
+    let rejected = client
+        .post(format!("http://{addr}/v1/threads"))
+        .json(&json!({ "workspace_roots": [parent] }))
+        .send()
+        .await?;
+    assert_eq!(
+        rejected.status(),
+        StatusCode::BAD_REQUEST,
+        "attaching the primary's parent must be rejected at intake"
+    );
+
+    // A `~` spelling is non-absolute: rejected instead of silently dropped
+    // from the declared set.
+    let rejected = client
+        .post(format!("http://{addr}/v1/threads"))
+        .json(&json!({ "workspace_roots": ["~/shared"] }))
+        .send()
+        .await?;
+    assert_eq!(
+        rejected.status(),
+        StatusCode::BAD_REQUEST,
+        "a non-absolute root must be rejected, not silently dropped"
+    );
+
+    // A normal sibling root still attaches, and the PATCH lane reuses the
+    // same validation for an explicit replacement set.
+    let sibling = root.join("sibling-lib");
+    let created: serde_json::Value = client
+        .post(format!("http://{addr}/v1/threads"))
+        .json(&json!({ "workspace_roots": [sibling.to_string_lossy()] }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let thread_id = created["id"].as_str().context("missing thread id")?;
+    assert_eq!(
+        created["workspace_roots"],
+        json!([workspace.to_string_lossy(), sibling.to_string_lossy()]),
+        "a sibling root attaches beside the absolute primary"
+    );
+
+    let rejected = client
+        .patch(format!("http://{addr}/v1/threads/{thread_id}"))
+        .json(&json!({ "workspace_roots": ["/deep/../../.."] }))
+        .send()
+        .await?;
+    assert_eq!(
+        rejected.status(),
+        StatusCode::BAD_REQUEST,
+        "PATCH re-declares the set and must reject a super-root spelling too"
+    );
+
+    handle.abort();
+    Ok(())
+}
+
 #[tokio::test]
 async fn session_create_from_completed_thread_saves_messages() -> Result<()> {
     let root = std::env::temp_dir().join(format!("deepseek-thread-session-{}", Uuid::new_v4()));
@@ -5421,6 +5526,110 @@ async fn session_put_route_refuses_a_live_session_without_erasing_its_roots() ->
         ],
         "the refused PUT must leave the live root set untouched"
     );
+
+    handle.abort();
+    Ok(())
+}
+
+/// A padded session id in a `PUT /v1/sessions` body must hit the same
+/// live-session conflict as the bare id: every store path trims the id, so
+/// the padded spelling names the same document — and used to slip past the
+/// guard as a "stranger" while overwriting the live owner's roots.
+#[tokio::test]
+async fn session_put_route_refuses_a_padded_live_session_id_with_a_conflict() -> Result<()> {
+    // The live-session claim is process-global, same as the PATCH route test.
+    let _lock = lock_test_env();
+    let Some((addr, sessions_dir, handle)) =
+        spawn_server_with_saved_sessions(&[("sess-live-pad", "Held open", false)]).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    let manager = crate::session_manager::SessionManager::new(sessions_dir.clone())?;
+    let mut stored = manager.load_session("sess-live-pad")?;
+    stored.metadata.workspace_roots = vec![
+        stored.metadata.workspace.clone(),
+        PathBuf::from("/shared-live-root"),
+    ];
+    manager.save_session(&stored)?;
+
+    crate::session_manager::set_live_session(Some("sess-live-pad"));
+    let conflict = client
+        .put(format!("http://{addr}/v1/sessions"))
+        .json(&json!({
+            "thread_id": "thr-padded-id",
+            "session_id": "  sess-live-pad  "
+        }))
+        .send()
+        .await?;
+    assert_eq!(
+        conflict.status(),
+        StatusCode::CONFLICT,
+        "the padded id must be judged as the live session it trims to"
+    );
+    crate::session_manager::set_live_session(None);
+
+    // An explicit-but-empty id has no target at all: rejected, not silently
+    // turned into "create a new session".
+    let blank = client
+        .put(format!("http://{addr}/v1/sessions"))
+        .json(&json!({
+            "thread_id": "thr-padded-id",
+            "session_id": "   "
+        }))
+        .send()
+        .await?;
+    assert_eq!(blank.status(), StatusCode::BAD_REQUEST);
+
+    let reloaded = manager.load_session("sess-live-pad")?;
+    assert_eq!(
+        reloaded.metadata.workspace_roots,
+        vec![
+            reloaded.metadata.workspace.clone(),
+            PathBuf::from("/shared-live-root")
+        ],
+        "neither refused request may touch the live root set"
+    );
+
+    handle.abort();
+    Ok(())
+}
+
+/// The PATCH lane is the same bypass in a path segment: a trailing-space id
+/// (`%20`) used to read as a stranger to the live-session guard while
+/// `rename_session` trimmed it onto the live owner's document.
+#[tokio::test]
+async fn session_patch_route_refuses_a_padded_live_session_id_with_a_conflict() -> Result<()> {
+    // The live-session claim is process-global, same as the PATCH route test.
+    let _lock = lock_test_env();
+    let Some((addr, _dir, handle)) =
+        spawn_server_with_saved_sessions(&[("sess-live-path", "Held open", false)]).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    crate::session_manager::set_live_session(Some("sess-live-path"));
+    let conflict = client
+        .patch(format!("http://{addr}/v1/sessions/sess-live-path%20"))
+        .json(&json!({ "title": "Renamed through the padding" }))
+        .send()
+        .await?;
+    assert_eq!(
+        conflict.status(),
+        StatusCode::CONFLICT,
+        "a path id that trims to the live session must take the conflict"
+    );
+
+    // The unpadded spelling still works once the claim is released.
+    crate::session_manager::set_live_session(None);
+    let allowed = client
+        .patch(format!("http://{addr}/v1/sessions/sess-live-path"))
+        .json(&json!({ "title": "Renamed through the padding" }))
+        .send()
+        .await?;
+    assert_eq!(allowed.status(), StatusCode::OK);
 
     handle.abort();
     Ok(())

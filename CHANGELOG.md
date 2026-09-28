@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Resuming or forking a thread that does not exist now fails loudly:
+  `POST /v1/threads/{id}/resume` and `POST /v1/threads/{id}/fork` answer
+  HTTP 404, and the stdio `thread/resume` / `thread/fork` methods answer the
+  typed `thread_not_found` error (`-32004`), where both lanes previously
+  answered success with a `status: "missing"` body that every caller had to
+  know to check.
+- `PUT /v1/sessions` against a session that is open in an interactive
+  Codewhale window now answers HTTP 409 instead of writing behind the live
+  window's back — its next autosave rebuilt the document from live state and
+  would have reverted the write anyway. Session ids are trimmed once where
+  the API takes them (path and body), and an explicit empty id is rejected
+  with 400, so a padded id can no longer read as a stranger to the
+  live-session conflict and as the owner to the store.
+- Declared workspace root sets are validated at intake instead of silently
+  reshaped. `POST /v1/threads`, `PATCH /v1/threads/{id}`, and the stdio
+  `thread/start` / `thread/resume` / `thread/fork` equivalents now reject,
+  with HTTP 400 or a JSON-RPC error: a root that is not an absolute path
+  (`~/shared` is refused rather than silently dropped from the set), a root
+  that normalizes to the filesystem root (`/`, `/..`), and a root that is an
+  ancestor of the primary workspace (its parent directory). Each of those
+  widened the per-turn sandbox's writable roots past what the caller
+  declared; a root that merely sits under the primary is still accepted.
+- Relative `--workspace` values are resolved against the process working
+  directory at startup instead of reaching the boundary checks as a root
+  whose normalized form contains every path.
+- A worktree child session's exec lane no longer inherits the parent
+  session's writable roots: the lane is re-derived at spawn and at resume
+  from the child's own workspace.
+- Session failure diagnostics collect candidate string fields verbatim: the
+  classifier no longer trims surrounding whitespace before matching
+  (upstream v0.9.12 hardening).
+
 ### Fixed
 
 - API-backed `[search]` providers now visibly degrade directly to the
