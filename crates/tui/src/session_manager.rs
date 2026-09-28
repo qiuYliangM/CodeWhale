@@ -5058,3 +5058,49 @@ mod tests {
         assert!(!is_live_session("sess-unknown"));
     }
 }
+
+#[test]
+fn reclaim_keeps_a_live_claimed_session_dir() {
+    // Round-21 should-fix 5 (the keystone for B20-3's registry-retention
+    // decision): the retired HTTP guard left the registry one real
+    // consumer — the orphan-dir reclaim must keep a directory whose id
+    // is claimed live by the interactive surface, or that keep would be
+    // dead code. Hermetic under ENV_LOCK + PINVOU3_HOME.
+    let _lock = crate::shell_dispatcher::test_env_lock::lock_test_env();
+    let prev_home = std::env::var("PINVOU3_HOME").ok();
+    let home =
+        std::env::temp_dir().join(format!("pinvou3-reclaim-live-home-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    // SAFETY: platform::paths::tests::ENV_LOCK held; env writes are serialized.
+    unsafe { std::env::set_var("PINVOU3_HOME", &home) };
+    let manager = SessionManager::new(home.join("sessions")).expect("session manager");
+
+    // An orphan session directory in the exact shape the runtime mints.
+    let id = "3f2504e0-4f89-41d3-9a0c-0305e82c3301";
+    let dir = home.join("sessions").join(id);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Unclaimed: the orphan is reclaimed.
+    manager.reclaim_orphaned_session_dirs();
+    assert!(!dir.exists(), "an unclaimed orphan is reclaimed");
+
+    // Re-create it and claim it live: the reclaim must keep it.
+    std::fs::create_dir_all(&dir).unwrap();
+    set_live_session(Some(id));
+    manager.reclaim_orphaned_session_dirs();
+    assert!(dir.exists(), "a live-claimed orphan survives the reclaim");
+
+    set_live_session(None);
+    manager.reclaim_orphaned_session_dirs();
+    assert!(!dir.exists(), "releasing the claim re-opens the reclaim");
+
+    // SAFETY: ENV_LOCK held for the whole test; restoring the caller's
+    // environment.
+    unsafe {
+        match prev_home {
+            Some(home) => std::env::set_var("PINVOU3_HOME", home),
+            None => std::env::remove_var("PINVOU3_HOME"),
+        }
+    }
+    let _ = std::fs::remove_dir_all(&home);
+}
