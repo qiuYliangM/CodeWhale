@@ -211,9 +211,14 @@ fn is_filesystem_root(path: &Path) -> bool {
 /// A caller-declared replacement set goes through
 /// [`validate_workspace_roots`], so a super-root or an ancestor of the
 /// primary is rejected here rather than admitted into the persisted row.
-/// Branches that only re-shape *persisted* values keep the tolerant
-/// normalizer: a legacy or hand-edited row must stay loadable, not strand
-/// its owner at resume time.
+/// The same holds for the cwd-only move: moving the primary is a caller
+/// decision, and re-basing the persisted additional roots onto it must not
+/// durably mint a set whose entries are ancestors of (or super-roots for)
+/// the new primary — the semantically identical PATCH workspace-only move
+/// rejects, and a widened row would also strand a later bare fork, which
+/// validates the inherited set. Only the pure-load branch (no overrides)
+/// keeps the tolerant normalizer: a legacy or hand-edited row must stay
+/// loadable, not strand its owner at resume time.
 fn resolve_resume_roots(
     persisted_cwd: &Path,
     persisted_roots: &[PathBuf],
@@ -242,7 +247,11 @@ fn resolve_resume_roots(
             .filter(|root| root.as_path() != persisted_cwd)
             .cloned()
             .collect();
-        let roots = normalize_workspace_roots(new_cwd, &additional);
+        // The persisted entries were admitted under the OLD primary; after
+        // the caller moves it they must satisfy the same intake rules the
+        // replacement set does, or the persisted row would grow a widening
+        // entry this topic's intake exists to refuse.
+        let roots = validate_workspace_roots(new_cwd, &additional)?;
         return Ok((new_cwd.clone(), roots));
     }
     let roots = normalize_workspace_roots(persisted_cwd, persisted_roots);
@@ -4076,6 +4085,44 @@ mod tests {
                 PathBuf::from("/keep"),
                 PathBuf::from("/also")
             ]
+        );
+    }
+
+    #[test]
+    fn resume_cwd_only_rejects_a_rebased_ancestor_root() {
+        // Moving the primary is a caller decision, so the re-based set meets
+        // the same intake rules as a replacement set: a persisted additional
+        // root that becomes an ancestor of (or a super-root for) the new
+        // primary must error, not durably widen the persisted row — a
+        // widened row would also strand a later bare fork, which validates
+        // the inherited set.
+        let store = temp_core_state("resume-roots-cwd-ancestor");
+        let mut metadata = test_thread_metadata("thread-roots");
+        metadata.cwd = PathBuf::from("/p/x");
+        metadata.workspace_roots = vec![PathBuf::from("/p/x"), PathBuf::from("/p")];
+        store.upsert_thread(&metadata).expect("seed thread");
+
+        let mut manager = ThreadManager::new(store);
+        let mut params = resume_params("thread-roots");
+        params.cwd = Some(PathBuf::from("/p/x/deep"));
+        let err = manager
+            .resume_thread_with_history(&params, "deepseek".to_string())
+            .expect_err("an additional root that turns ancestor must be rejected");
+        assert!(
+            err.to_string().contains("ancestor of the primary"),
+            "unexpected error: {err}"
+        );
+
+        // The persisted row is untouched by the failed attempt.
+        let persisted = manager
+            .state_store()
+            .get_thread("thread-roots")
+            .expect("read thread")
+            .expect("thread persisted");
+        assert_eq!(persisted.cwd, PathBuf::from("/p/x"));
+        assert_eq!(
+            persisted.workspace_roots,
+            vec![PathBuf::from("/p/x"), PathBuf::from("/p")]
         );
     }
 

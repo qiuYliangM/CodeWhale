@@ -31,6 +31,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ancestor of the primary workspace (its parent directory). Each of those
   widened the per-turn sandbox's writable roots past what the caller
   declared; a root that merely sits under the primary is still accepted.
+  The resume lane that moves the primary (`cwd` without `workspace_roots`)
+  validates the re-based persisted set with the same rules instead of
+  re-anchoring it tolerantly, so a persisted entry that becomes an ancestor
+  of the new primary errors rather than silently widening the row.
 - Relative `--workspace` values are resolved against the process working
   directory at startup instead of reaching the boundary checks as a root
   whose normalized form contains every path.
