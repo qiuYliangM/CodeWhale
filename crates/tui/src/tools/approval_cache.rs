@@ -100,7 +100,10 @@ pub fn build_approval_grouping_key(tool_name: &str, input: &serde_json::Value) -
             // session workspace must not silently cover the same command
             // redirected into another root.
             match shell_cwd_operand(input) {
-                Some(cwd) => format!("shell:{prefix}@cwd:{cwd}"),
+                // Length-prefix the operand (round-20 B20-2): the raw
+                // `prefix@cwd:` concatenation is non-injective — model-craftable
+                // spellings of prefix/cwd collide across the boundary.
+                Some(cwd) => format!("shell:{prefix}@cwd:{}:{cwd}", cwd.len()),
                 None => format!("shell:{prefix}"),
             }
         }
@@ -139,10 +142,14 @@ fn command_prefix(input: &serde_json::Value) -> String {
 /// Return the exec `cwd`/`working_dir` operand when the call carries one —
 /// the value the approval side resolves and judges as the effective cwd.
 fn shell_cwd_operand(input: &serde_json::Value) -> Option<&str> {
-    input
-        .get("cwd")
-        .or_else(|| input.get("working_dir"))
-        .and_then(Value::as_str)
+    // Round-20 B20-2: mirror the check-side and execution field semantics —
+    // `get("cwd")` returning `Some(Value::Null)` used to block the
+    // `working_dir` fallback, keying the grant to the no-operand family
+    // while the check/exec treated the same call as redirected to
+    // `working_dir`. Skip Null (and non-string) values like they do.
+    ["cwd", "working_dir"]
+        .iter()
+        .find_map(|name| input.get(name).and_then(Value::as_str))
         .filter(|cwd| !cwd.is_empty())
 }
 
@@ -427,6 +434,24 @@ mod tests {
         assert_eq!(
             redirected, via_working_dir,
             "cwd and working_dir are the same operand for the grant key"
+        );
+
+        // Round-20 B20-2: `cwd: null` must not block the `working_dir`
+        // fallback — the null spelling used to key the NO-OPERAND family
+        // while the check and execution treated the same call as redirected,
+        // letting a session-approved plain command run in the attached root
+        // unprompted.
+        let null_cwd_with_working_dir = build_approval_grouping_key(
+            "exec_shell",
+            &json!({"command": "git status", "cwd": null, "working_dir": "/attached/repo"}),
+        );
+        assert_eq!(
+            redirected, null_cwd_with_working_dir,
+            "a null cwd plus working_dir keys as the redirected operand"
+        );
+        assert_ne!(
+            at_workspace, null_cwd_with_working_dir,
+            "the redirected spelling must not collide with the no-operand family"
         );
     }
 

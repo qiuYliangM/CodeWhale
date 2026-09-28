@@ -764,22 +764,13 @@ pub(super) async fn save_current_session(
         }
     };
 
-    // A session open in this process's interactive surface is owned by that
-    // surface: its autosave rebuilds the document from live state (including
-    // the workspace root set) and would revert this write. Fail closed with
-    // a typed conflict — the same guard `rename_session` applies to external
-    // mutators — rather than let the two writers flip-flop with no
-    // arbitration. Refuse before touching the thread engine so the guard
-    // does not depend on the thread's state.
-    if let Some(ref session_id) = req.session_id
-        && crate::session_manager::is_live_session(session_id)
-    {
-        return Err(map_session_err(
-            session_id,
-            crate::session_manager::live_session_conflict(session_id),
-            "save",
-        ));
-    }
+    // Round-20 B20-3: the live-session guard was removed. The static
+    // registry is process-local and the runtime HTTP server never coexists
+    // with an interactive TUI surface in any shipped topology, so the guard
+    // could never engage — it headlined a breaking change that is
+    // unobservable (the registry itself stays: same-process retention
+    // pruning consults it). A concurrent writer in the same process is
+    // still arbitrated by last-write-wins at the store layer.
 
     // Get the engine handle (loads the thread into an engine if needed),
     // then request a session snapshot. This reuses the same code path as

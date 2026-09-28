@@ -170,8 +170,20 @@ pub fn fork_from_session(app: &mut App, session_id_or_prefix: &str) -> CommandRe
         .filter(|root| **root != source_session.metadata.workspace)
         .cloned()
         .collect();
-    forked.metadata.workspace_roots =
-        codewhale_core::normalize_workspace_roots(&app.workspace, &additional_roots);
+    // Round-20 should-fix 1: same intake rule as /cd and the runtime lanes —
+    // a re-based set that widens past the fork's primary must not persist.
+    forked.metadata.workspace_roots = match codewhale_core::validate_workspace_roots(
+        &app.workspace,
+        &additional_roots,
+    ) {
+        Ok(roots) => roots,
+        Err(err) => {
+            return CommandResult::error(format!(
+                "Cannot fork: the source root set re-based onto {} would widen past it ({err:#}). Re-declare the roots on the fork.",
+                app.workspace.display()
+            ));
+        }
+    };
     if let Err(err) = manager.save_session(&forked) {
         return CommandResult::error(format!("Failed to save forked session: {err}"));
     }

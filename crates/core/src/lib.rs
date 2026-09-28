@@ -115,6 +115,15 @@ pub fn normalize_workspace_roots(cwd: &Path, roots: &[PathBuf]) -> Vec<PathBuf> 
 /// Intake validation for a caller-declared root set: admit it whole or reject
 /// it with an error, never silently reshape it.
 ///
+/// LEXICAL ONLY (review #484/CodeWhale round-20 B20-4): the checks run on
+/// `normalize_lexical_components` output, while enforcement canonicalizes
+/// per root — a symlink can make a lexically-sibling root the primary's
+/// canonical ancestor (macOS `/tmp` ↔ `/private/tmp`), and a symlink to `/`
+/// inside the workspace passes as a lexical child. Canonicalize-at-intake
+/// (or re-checking at `get_writable_roots` materialization) is the
+/// scheduled promotion; until then the rejection is advisory for any root
+/// whose spelling differs from its canonical form.
+///
 /// The per-turn sandbox copies this set verbatim into
 /// `WorkspaceWrite.writable_roots`, so three classes of declared entry widen
 /// the boundary past anything the caller saw, and each is rejected here:

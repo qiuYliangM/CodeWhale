@@ -26816,3 +26816,77 @@ async fn a_booting_turn_keeps_an_already_declared_surface_reason() {
         last
     );
 }
+
+// Round-20 B20-1: the judged cwd must resolve symlinks the way execution
+// does. `link/..` normalizes lexically back into the primary but lands
+// in the attached repo on disk; a primary-scoped allow must not fire for
+// it, and neither for the link itself. Unix-gated: symlink creation is
+// the fixture (architecture-guard allow-target-cfg).
+#[test]
+#[cfg(unix)]
+fn exec_judged_cwd_resolves_symlinks_like_execution() {
+    use std::path::Path;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let primary_raw = temp.path().join("ws");
+    let attached_raw = temp.path().join("attached").join("repo");
+    std::fs::create_dir_all(&primary_raw).unwrap();
+    std::fs::create_dir_all(&attached_raw).unwrap();
+    // Judge and scope against canonical spellings so the control legs are
+    // platform-stable (macOS /var → /private/var would otherwise flip the
+    // control leg to a modal).
+    let primary = std::fs::canonicalize(&primary_raw).unwrap();
+    let attached = std::fs::canonicalize(&attached_raw).unwrap();
+    std::os::unix::fs::symlink(&attached, primary_raw.join("link")).unwrap();
+
+    let rule = codewhale_execpolicy::ToolAskRule::exec_shell("git push")
+        .into_exact_workspace_allow(primary.to_string_lossy().as_ref());
+    let config = EngineConfig {
+        exec_policy_engine: codewhale_execpolicy::ExecPolicyEngine::with_rulesets(vec![
+            codewhale_execpolicy::Ruleset::user(vec![], vec![]).with_ask_rules(vec![rule]),
+        ]),
+        ..EngineConfig::default()
+    };
+    let roots = [attached.clone()];
+
+    // Control: in the primary itself the grant fires.
+    assert_eq!(
+        exec_shell_ask_rule_decision(
+            &config,
+            "exec_shell",
+            &json!({"command": "git push", "cwd": "."}),
+            Path::new(&primary),
+            &roots,
+            crate::tui::approval::ApprovalMode::Suggest,
+        ),
+        Some(ToolAskRuleDecision::Allow)
+    );
+
+    // symlink+`..`: lexically back in the primary, canonically the
+    // attached repo — the /primary-scoped grant must not fire.
+    assert_ne!(
+        exec_shell_ask_rule_decision(
+            &config,
+            "exec_shell",
+            &json!({"command": "git push", "cwd": "link/.."}),
+            Path::new(&primary),
+            &roots,
+            crate::tui::approval::ApprovalMode::Suggest,
+        ),
+        Some(ToolAskRuleDecision::Allow)
+    );
+
+    // symlink-interior: the link itself resolves into the attached repo.
+    let through_link = primary.join("link");
+    assert_ne!(
+        exec_shell_ask_rule_decision(
+            &config,
+            "exec_shell",
+            &json!({"command": "git push", "cwd": through_link}),
+            Path::new(&primary),
+            &roots,
+            crate::tui::approval::ApprovalMode::Suggest,
+        ),
+        Some(ToolAskRuleDecision::Allow)
+    );
+}

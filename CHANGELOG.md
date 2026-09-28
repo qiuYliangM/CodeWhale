@@ -15,13 +15,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   typed `thread_not_found` error (`-32004`), where both lanes previously
   answered success with a `status: "missing"` body that every caller had to
   know to check.
-- `PUT /v1/sessions` against a session that is open in an interactive
-  Codewhale window now answers HTTP 409 instead of writing behind the live
-  window's back — its next autosave rebuilt the document from live state and
-  would have reverted the write anyway. Session ids are trimmed once where
-  the API takes them (path and body), and an explicit empty id is rejected
-  with 400, so a padded id can no longer read as a stranger to the
-  live-session conflict and as the owner to the store.
 - Declared workspace root sets are validated at intake instead of silently
   reshaped. `POST /v1/threads`, `PATCH /v1/threads/{id}`, and the stdio
   `thread/start` / `thread/resume` / `thread/fork` equivalents now reject,
@@ -31,10 +24,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ancestor of the primary workspace (its parent directory). Each of those
   widened the per-turn sandbox's writable roots past what the caller
   declared; a root that merely sits under the primary is still accepted.
+  The checks are lexical: enforcement canonicalizes per root, so symlink
+  spellings can carry a sibling past the ancestor rejection (canonicalize-
+  at-intake is scheduled).
   The resume lane that moves the primary (`cwd` without `workspace_roots`)
   validates the re-based persisted set with the same rules instead of
   re-anchoring it tolerantly, so a persisted entry that becomes an ancestor
   of the new primary errors rather than silently widening the row.
+- Approval grants for shell commands are keyed to the command family AND
+  the `cwd`/`working_dir` operand (length-prefixed in the key), and a
+  `cwd: null` spelling no longer falls back to the no-operand family —
+  previously a session-approved plain command could be replayed redirected
+  into another root. Stored grants re-key; re-approval is required.
+- The exec approval context judges the `cwd`/`working_dir` operand through
+  the same canonical resolution execution uses: a symlinked operand
+  (`link/..`) no longer normalizes back into the primary and fires a
+  primary-scoped allow while executing in an attached root.
+- The never-fires `PUT`/`PATCH /v1/sessions` live-session conflict (409)
+  was removed: the process-local registry cannot coexist with the runtime
+  HTTP server in any shipped topology. Same-process writers converge by
+  last-write-wins at the store layer; the registry itself remains for
+  retention pruning.
+- `PATCH /v1/threads/{id}` with a `workspace`-only change now validates the
+  re-based root set with the same intake rules as a replacement, instead of
+  re-anchoring it tolerantly (a persisted entry that becomes an ancestor of
+  the new primary errors rather than widening the row).
+- The `/cd` receipt for a moved-away directory changed severity from a
+  passive notice to a typed warning, and its guard widened to every
+  workspace swap lane.
+- The cached-resume path no longer bumps `archived_at` (the preserve arm
+  existed to protect it and is unreachable); `isolated_worktree` defaults
+  flipped from false to true for resume-lane worktree children; and
+  `string_field` deny rules now match raw (untrimmed) collected values,
+  narrowing what they deny.
 - Relative `--workspace` values are resolved against the process working
   directory at startup instead of reaching the boundary checks as a root
   whose normalized form contains every path.

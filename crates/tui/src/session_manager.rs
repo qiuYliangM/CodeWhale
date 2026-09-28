@@ -361,21 +361,6 @@ pub fn is_live_session(session_id: &str) -> bool {
         .map(|live| live.contains(trimmed))
         .unwrap_or(true)
 }
-
-/// The error an external writer gets when the session is live.
-///
-/// `ResourceBusy` so callers can map it to a typed conflict rather than
-/// pattern-matching on a message.
-pub(crate) fn live_session_conflict(session_id: &str) -> std::io::Error {
-    std::io::Error::new(
-        std::io::ErrorKind::ResourceBusy,
-        format!(
-            "session '{session_id}' is open in an interactive Codewhale session; \
-             change it there instead — an external write would be reverted by its next autosave"
-        ),
-    )
-}
-
 /// File-name stem of the sidecar mapping session ids to the session
 /// instance (process boot) that created their persisted record. Lives in
 /// the sessions directory next to the `<id>.json` records it describes.
@@ -1645,9 +1630,11 @@ impl SessionManager {
         archived: bool,
         mutator: SessionMutator,
     ) -> std::io::Result<SessionMetadata> {
-        if mutator == SessionMutator::External && is_live_session(id) {
-            return Err(live_session_conflict(id));
-        }
+        let _ = mutator; // retained in the API shape; the live guard is retired (round-20 B20-3)
+        // Round-20 B20-3: no live-session guard here — the registry is
+        // process-local and the External mutator's only lane (the runtime
+        // HTTP server) never coexists with an interactive surface in a
+        // shipped topology, so the check could never engage.
         let mut session = self.load_session(id)?;
         if session.metadata.archived == archived {
             return Ok(session.metadata);
@@ -1712,9 +1699,10 @@ impl SessionManager {
         mutator: SessionMutator,
     ) -> std::io::Result<SessionMetadata> {
         let title = normalize_session_title(title)?;
-        if mutator == SessionMutator::External && is_live_session(id) {
-            return Err(live_session_conflict(id));
-        }
+        let _ = mutator; // retained in the API shape; the live guard is retired (round-20 B20-3)
+        // Round-20 B20-3: no live-session guard (see set_session_archived) —
+        // the External lane cannot coexist with the interactive surface that
+        // populates the registry.
         let mut session = self.load_session(id)?;
         if session.metadata.title == title {
             return Ok(session.metadata);

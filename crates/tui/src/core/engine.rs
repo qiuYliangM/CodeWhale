@@ -8148,9 +8148,13 @@ pub(crate) fn exec_shell_ask_rule_decision_for_policy(
     // roots-aware `ToolContext::resolve_path` and executes there, so the
     // approval context must judge the same effective cwd: an allow rule
     // scoped to the primary repo must not auto-approve the same command
-    // redirected into an attached root. The join mirrors execution
-    // (absolute as-is, relative onto the primary root) and stays lexical,
-    // matching `normalize_workspace_roots`.
+    // redirected into an attached root. Execution canonicalizes existing
+    // components (symlinks included) before its boundary check, so the
+    // judgment canonicalizes the same way: the lexical join alone let
+    // `link/..` normalize back into the primary while execution landed in
+    // the symlink target, firing a primary-scoped allow across the boundary
+    // (review #484/CodeWhale round-20 B20-1). A nonexistent operand keeps
+    // the lexical join, matching resolve_nonexistent_path's behavior.
     let effective_cwd = ["cwd", "working_dir"]
         .iter()
         .find_map(|name| tool_input.get(name).and_then(Value::as_str))
@@ -8161,7 +8165,9 @@ pub(crate) fn exec_shell_ask_rule_decision_for_policy(
             } else {
                 workspace.join(raw)
             };
-            crate::tools::spec::normalize_path(&joined)
+            joined
+                .canonicalize()
+                .unwrap_or_else(|_| crate::tools::spec::normalize_path(&joined))
         });
     tool_ask_rule_decision_for_context(
         exec_policy_engine,

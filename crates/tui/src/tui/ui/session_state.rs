@@ -757,14 +757,31 @@ pub(crate) async fn switch_workspace(
     // root set (it stopped being the session's directory), the new
     // workspace takes the primary slot, and additional roots survive
     // re-normalized against the new primary.
-    let old_workspace = std::mem::replace(&mut app.workspace, workspace.clone());
-    let additional: Vec<PathBuf> = app
+    // Round-20 should-fix 1: the runtime PATCH workspace-only branch and
+    // `resolve_resume_roots` reject a re-based set whose entries become an
+    // ancestor of (or a super-root for) the new primary — persisting one
+    // here would strand a later bare fork/resume-move with a hard error.
+    // Validate BEFORE the swap and refuse the move with the same rule.
+    let carried: Vec<PathBuf> = app
         .workspace_roots
         .iter()
-        .filter(|root| **root != old_workspace)
+        .filter(|root| **root != app.workspace)
         .cloned()
         .collect();
-    app.workspace_roots = codewhale_core::normalize_workspace_roots(&workspace, &additional);
+    let re_based = match codewhale_core::validate_workspace_roots(&workspace, &carried) {
+        Ok(roots) => roots,
+        Err(err) => {
+            let message = format!(
+                "Cannot switch workspace to {}: the carried root set would widen past the new directory ({err:#}). Re-declare the roots after switching.",
+                workspace.display()
+            );
+            app.status_message = Some(message.clone());
+            app.add_message(HistoryCell::System { content: message });
+            return;
+        }
+    };
+    app.workspace = workspace.clone();
+    app.workspace_roots = re_based;
 
     apply_workspace_runtime_state(app, config, workspace.clone());
     sync_runtime_workspace_state(task_manager, workspace.clone()).await;

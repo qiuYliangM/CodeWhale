@@ -565,10 +565,12 @@ archive notion.
 
 While a session is open in an interactive Codewhale process, that process holds
 the authoritative copy in memory and rewrites the whole document on its next
-autosave. `PATCH`, and `PUT /v1/sessions` when its `session_id` names that
-session, therefore fail closed on it with `409 Conflict` rather than writing
-something that would be silently reverted. Change it in the terminal
-instead. A standalone `codewhale web` holds nothing open and is never blocked.
+autosave. **Retracted (round-20 B20-3):** the `409 Conflict` guard on
+`PATCH` and `PUT /v1/sessions` was removed — the process-local live-session
+registry cannot coexist with the runtime HTTP server in any shipped
+topology, so the conflict was unobservable and the guard is gone. Same-
+process writers converge by last-write-wins at the store layer; change a
+session open in the terminal from the terminal.
 
 `GET /v1/sessions/{id}?peek=true` returns a bounded, redacted, read-only view
 instead of the transcript: at most 12 entries of at most 400 characters each
@@ -629,7 +631,10 @@ root that is an ancestor of the primary workspace (its parent directory)
 all answer `400 Bad Request` with the reason — each of those would widen
 the per-turn sandbox past what the request declared. A root that sits under
 the primary is accepted, and an explicit empty array still clears back to
-the bare workspace.
+the bare workspace. These rejection checks are **lexical** (round-20
+B20-4): enforcement canonicalizes per root, so a symlink spelling can carry
+a lexically-sibling root past the ancestor rejection; canonicalize-at-
+intake is the scheduled promotion.
 
 `reasoning_effort` uses the canonical Runtime vocabulary (`auto`, `off`,
 `low`, `medium`, `high`, `xhigh`, `ultra`, or `max`; documented compatibility
