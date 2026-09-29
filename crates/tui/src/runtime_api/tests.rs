@@ -5219,6 +5219,69 @@ async fn restore_route_names_the_attached_roots_boundary_for_multi_root_threads(
         "a single-root restore must not grow the clause: {body}"
     );
 
+    // Round-23 B23-2: the ordinary save/re-key sequence — a `PUT /v1/sessions`
+    // moves the multi-root thread to a NEW session handle after the snapshot
+    // was tagged with the old one. The clause must survive the re-key: the
+    // tagged snapshot proves an interactive owner existed and proves nothing
+    // about the roots, so the boundary is named even though no live thread
+    // matches the old sid any more.
+    let rekey: serde_json::Value = client
+        .put(format!("http://{addr}/v1/sessions"))
+        .json(&json!({
+            "thread_id": multi.id,
+            "session_id": "sess-multi-rekeyed",
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(rekey["session_id"], "sess-multi-rekeyed", "{rekey}");
+    let response = client
+        .post(format!(
+            "http://{addr}/v1/snapshots/{}/restore",
+            multi_snap.0
+        ))
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await?;
+    assert_eq!(
+        body["boundary"]["attached_roots_not_reverted"],
+        json!(true),
+        "the re-keyed owner must not drop the boundary clause: {body}"
+    );
+
+    // Round-23 B23-1 legs: a `..`-spelled root and an inward-symlink root
+    // component-wise "nest" under the primary over raw spellings while
+    // consumers canonicalize them outside — the clause must fire for both
+    // (the old predicate withheld it, fail-unsafe).
+    let dotdot_thread = runtime_threads
+        .create_thread(CreateThreadRequest {
+            workspace: Some(workspace.join("ws")),
+            workspace_roots: vec![workspace.join("ws").join("..").join("shared2")],
+            ..CreateThreadRequest::default()
+        })
+        .await?;
+    runtime_threads
+        .set_thread_session_id(&dotdot_thread.id, "sess-dotdot")
+        .await?;
+    let dotdot_snap = repo.snapshot_with_session("pre-turn:3", Some("sess-dotdot"))?;
+    let response = client
+        .post(format!(
+            "http://{addr}/v1/snapshots/{}/restore",
+            dotdot_snap.0
+        ))
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await?;
+    assert_eq!(
+        body["boundary"]["attached_roots_not_reverted"],
+        json!(true),
+        "a ..-spelled attached root must still fire the boundary: {body}"
+    );
+
     handle.abort();
     Ok(())
 }

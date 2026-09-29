@@ -26,7 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   declared; a root that merely sits under the primary is still accepted.
   The checks are lexical: enforcement canonicalizes per root, so symlink
   spellings can carry a sibling past the ancestor rejection (canonicalize-
-  at-intake is scheduled).
+  at-intake is scheduled). Declared sets are additionally capped at 64
+  entries at the validating intakes; the headless `POST /tool` lane
+  normalizes without the validator and caps at its invoke entry (round-23
+  SF23-2).
   The resume lane that moves the primary (`cwd` without `workspace_roots`)
   validates the re-based persisted set with the same rules instead of
   re-anchoring it tolerantly, so a persisted entry that becomes an ancestor
@@ -77,11 +80,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (a padded id is one session, not two rows distinguished by whitespace),
   and an explicit-but-empty id answers 400 instead of being silently turned
   into "create new".
-- The never-fires `PUT`/`PATCH /v1/sessions` live-session conflict (409)
-  was removed: the process-local registry cannot coexist with the runtime
-  HTTP server in any shipped topology. Same-process writers converge by
-  last-write-wins at the store layer; the registry itself remains for
-  retention pruning.
 - `PATCH /v1/threads/{id}` with a `workspace`-only change now validates the
   re-based root set with the same intake rules as a replacement, instead of
   re-anchoring it tolerantly (a persisted entry that becomes an ancestor of
@@ -96,7 +94,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   narrowing what they deny.
 - Relative `--workspace` values are resolved against the process working
   directory at startup instead of reaching the boundary checks as a root
-  whose normalized form contains every path.
+  whose normalized form contains every path — **on lanes that route through
+  `resolve_workspace`**; the headless `codewhale exec` / `codewhale serve`
+  lanes currently pass the value through unabsolutized (recorded as the
+  round-22 SF22-5 deferral).
 - A worktree child session's exec lane no longer inherits the parent
   session's writable roots: the lane is re-derived at spawn and at resume
   from the child's own workspace.

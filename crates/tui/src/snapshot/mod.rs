@@ -71,17 +71,30 @@ pub const ATTACHED_ROOTS_NOT_REVERTED_NOTE: &str =
 /// explicitly allows attached roots under the primary, and the side repo's
 /// work-tree IS the primary tree, so `repo.restore` reverts those writes
 /// with the primary — claiming they "were not rolled back" would tell the
-/// user the opposite of what happened. A root that merely lexically nests
-/// through a symlink spelling still fires the note (the lexical check
-/// cannot see through it); over-disclosing the boundary is the safe side.
+/// user the opposite of what happened.
+///
+/// Round-23 B23-1: BOTH sides are lexically normalized before the
+/// containment comparison. Over the raw persisted spellings a `..`-spelled
+/// root (`/ws/../shared`) or an inward-symlink root (`/ws/link →
+/// /elsewhere`) component-wise "nests" under the primary while every
+/// consumer canonicalizes it outside — writes there persist through the
+/// primary-rooted restore, so withholding the note for those spellings was
+/// fail-unsafe (and the previous doc asserted the opposite of the code).
+/// Normalizing first fires the note for exactly the roots whose consumers
+/// see them outside the primary; over-disclosing the boundary is the safe
+/// side.
 pub fn restore_covers_primary_only(
     workspace: &std::path::Path,
     workspace_roots: &[std::path::PathBuf],
 ) -> bool {
+    let workspace_lexical = codewhale_core::normalize_path_lexically(workspace);
     codewhale_core::normalize_workspace_roots(workspace, workspace_roots)
         .iter()
         .skip(1)
-        .any(|root| !root.starts_with(workspace))
+        .any(|root| {
+            let root_lexical = codewhale_core::normalize_path_lexically(root);
+            !root_lexical.starts_with(&workspace_lexical)
+        })
 }
 #[allow(unused_imports)]
 pub use repo::{

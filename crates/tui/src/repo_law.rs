@@ -134,12 +134,24 @@ fn write_target_paths(
     input: &Value,
 ) -> Vec<String> {
     let mut targets = Vec::new();
-    // `filePath` is the camelCase spelling `PATH_ALIASES` folds onto `path`
-    // at execute time (`tools/file.rs`); the default `ToolSpec::prepare`
-    // passes input through unchanged, so plan-time judgment must scan it
-    // too — a `filePath`-spelled write otherwise gets zero repo-law targets
-    // and no constitution ever fires (round-22 B22-2).
-    for key in ["path", "filePath", "target", "destination", "file_path"] {
+    // `filePath`/`file_path` are the spellings `PATH_ALIASES` folds onto
+    // `path` at execute time (`tools/file.rs`); the default `ToolSpec::
+    // prepare` passes input through unchanged, so plan-time judgment must
+    // scan them too — a `filePath`-spelled write otherwise gets zero
+    // repo-law targets and no constitution ever fires (round-22 B22-2).
+    // Round-23 nit: the alias spellings derive from the shared
+    // `PATH_ALIASES` constant (no second source of truth).
+    let alias_keys: Vec<String> = crate::tools::file::PATH_ALIASES
+        .iter()
+        .map(|alias| alias.alias.to_string())
+        .collect();
+    let mut keys: Vec<String> = vec![
+        "path".to_string(),
+        "target".to_string(),
+        "destination".to_string(),
+    ];
+    keys.extend(alias_keys);
+    for key in &keys {
         if let Some(path) = input.get(key).and_then(Value::as_str) {
             push_normalized(&mut targets, workspace, root, root_canonical, path);
         }

@@ -145,11 +145,11 @@ pub(super) const EXPECTED_HASH_DESCRIPTION: &str = "The `content_hash` from a pr
 /// value is an error rather than a coin flip, and any parameter that is not a
 /// known synonym still fails validation. The #5209 guarantee — no fabricated
 /// "Replaced 1 occurrence" for an edit that never landed — is unchanged.
-pub(super) struct ParamAlias {
+pub(crate) struct ParamAlias {
     /// Spelling a model might emit.
-    alias: &'static str,
+    pub(crate) alias: &'static str,
     /// Parameter this tool implements.
-    canonical: &'static str,
+    pub(crate) canonical: &'static str,
 }
 
 const fn alias(alias: &'static str, canonical: &'static str) -> ParamAlias {
@@ -159,7 +159,7 @@ const fn alias(alias: &'static str, canonical: &'static str) -> ParamAlias {
 /// Path spellings shared by every file action. `path` is CodeWhale's
 /// canonical name and the most common one in the field, but `file_path` is
 /// widespread enough in training data to be worth accepting everywhere.
-pub(super) const PATH_ALIASES: &[ParamAlias] =
+pub(crate) const PATH_ALIASES: &[ParamAlias] =
     &[alias("file_path", "path"), alias("filePath", "path")];
 
 /// Edit-specific spellings. Ordered most- to least-common.

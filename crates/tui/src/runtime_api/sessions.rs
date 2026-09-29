@@ -1019,9 +1019,9 @@ fn map_session_err(id: &str, err: std::io::Error, action: &str) -> ApiError {
         std::io::ErrorKind::InvalidInput => {
             ApiError::bad_request(format!("Invalid session id '{id}'"))
         }
-        // The session is open in an interactive Codewhale session, which holds
-        // the authoritative copy in memory. Fail closed with a typed conflict
-        // rather than write something its next autosave would revert.
+        // Round-20 B20-3 retired the producing live-session guard, so this
+        // kind has no producer left on Unix; the mapping is retained
+        // defensively (a future io producer must not surface as a 500).
         std::io::ErrorKind::ResourceBusy => ApiError {
             status: StatusCode::CONFLICT,
             message: err.to_string(),

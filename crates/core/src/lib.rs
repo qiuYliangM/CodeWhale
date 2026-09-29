@@ -1773,8 +1773,19 @@ impl Runtime {
             // set is the only roots intake with no validator in front of it,
             // so it at least goes through the shape normalizer the engine
             // lane applies — empty/relative entries dropped, primary
-            // prepended, deduped — instead of reaching the policy raw.
-            workspace_roots: normalize_workspace_roots(cwd, workspace_roots),
+            // prepended, deduped — instead of reaching the policy raw, and
+            // is capped like a validating intake: an unbounded declaration
+            // here is an O(n²) dedup per tool call, client-repeatable
+            // (round-23 SF23-2).
+            workspace_roots: normalize_workspace_roots(
+                cwd,
+                workspace_roots
+                    .iter()
+                    .take(MAX_WORKSPACE_ROOTS)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+            ),
         })?;
         let precheck = policy_precheck_payload(&decision, &command, &policy_cwd, execution_kind);
         let response_id = format!("tool-{}", Uuid::new_v4());
@@ -2265,19 +2276,26 @@ fn preview_from_initial_history(initial_history: &InitialHistory) -> String {
 }
 
 fn permission_path_for_call(call: &ToolCall) -> Option<String> {
+    // Round-23 SF23-5: the alias set mirrors the tools layer's
+    // `PATH_ALIASES` (file_path / filePath fold onto `path`) so a
+    // camelCase-spelled file call cannot enter exec policy with `path:
+    // None` — path-scoped deny/ask would be silently blind on this lane.
+    // DEPENDENCY: if the tools layer grows another alias, this set must
+    // move with it (the lane currently dispatches against an empty
+    // registry, which is the only mitigation keeping this latent).
+    fn path_from(value: &Value) -> Option<String> {
+        ["path", "file_path", "filePath"]
+            .iter()
+            .find_map(|name| value.get(name).and_then(Value::as_str))
+            .map(str::to_string)
+    }
     match &call.payload {
         ToolPayload::Function { arguments } => serde_json::from_str::<Value>(arguments)
             .ok()
-            .and_then(|value| {
-                value
-                    .get("path")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            }),
-        ToolPayload::Mcp { raw_arguments, .. } => raw_arguments
-            .get("path")
-            .and_then(Value::as_str)
-            .map(str::to_string),
+            .and_then(|value| path_from(&value)),
+        ToolPayload::Mcp { raw_arguments, .. } => {
+            path_from(raw_arguments).as_deref().map(str::to_string)
+        }
         ToolPayload::Custom { .. } | ToolPayload::LocalShell { .. } => None,
     }
 }
