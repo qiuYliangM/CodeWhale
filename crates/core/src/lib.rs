@@ -112,6 +112,141 @@ pub fn normalize_workspace_roots(cwd: &Path, roots: &[PathBuf]) -> Vec<PathBuf> 
     normalized
 }
 
+/// Lexically collapse CurDir and ParentDir components of `path` into the
+/// landing path the tool boundary resolves: a `..` at the filesystem root
+/// (or a Windows drive root) CLAMPS, it does not fail, and a `..` a relative
+/// spelling cannot pop is KEPT. This is the single implementation behind the
+/// tools layer's landing normalizer (`tools::spec::normalize_path`), shared
+/// so the judgment lanes can never drift from the gate
+/// (review #484/CodeWhale round-22 B22-5).
+pub fn normalize_path_lexically(path: &Path) -> PathBuf {
+    let mut prefix: Option<std::ffi::OsString> = None;
+    let mut is_root = false;
+    let mut stack: Vec<std::ffi::OsString> = Vec::new();
+
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(prefix_component) => {
+                prefix = Some(prefix_component.as_os_str().to_owned());
+            }
+            std::path::Component::RootDir => {
+                is_root = true;
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                let parent = std::path::Component::ParentDir.as_os_str();
+                if let Some(last) = stack.pop() {
+                    if last == parent {
+                        stack.push(last);
+                        stack.push(parent.to_owned());
+                    }
+                } else if !is_root {
+                    stack.push(parent.to_owned());
+                }
+            }
+            std::path::Component::Normal(part) => {
+                stack.push(part.to_owned());
+            }
+        }
+    }
+
+    let mut normalized = PathBuf::new();
+    if let Some(prefix) = prefix {
+        normalized.push(prefix);
+    }
+    if is_root {
+        normalized.push(Path::new(std::path::MAIN_SEPARATOR_STR));
+    }
+    for part in stack {
+        normalized.push(part);
+    }
+    normalized
+}
+
+/// Resolve a `cwd:`/`working_dir:`-style operand the way the exec lane does,
+/// so a policy judgment sees the directory execution actually runs in
+/// (review #484/CodeWhale round-22 B22-5): a relative spelling joins onto
+/// `workspace`; an existing result canonicalizes through any symlink; a
+/// nonexistent operand walks lexically to the deepest existing ancestor,
+/// canonicalizes it through any symlink, re-appends the popped tail, and
+/// normalizes — the same walk the engine's judged-cwd applies (round-20
+/// B20-1, round-21 B21-3). Both the headless `Runtime::invoke_tool` lane and
+/// the TUI engine lane call this one implementation.
+pub fn resolve_operand_cwd(workspace: &Path, raw: &str) -> PathBuf {
+    let raw_path = Path::new(raw);
+    let joined = if raw_path.is_absolute() {
+        raw_path.to_path_buf()
+    } else {
+        workspace.join(raw_path)
+    };
+    match joined.canonicalize() {
+        Ok(canonical) => canonical,
+        Err(_) => {
+            let mut ancestor = joined.clone();
+            let mut suffix: Vec<std::ffi::OsString> = Vec::new();
+            loop {
+                if ancestor.exists() {
+                    break;
+                }
+                if let Some(name) = ancestor.file_name() {
+                    suffix.push(name.to_owned());
+                }
+                match ancestor.parent() {
+                    Some(parent) if !parent.as_os_str().is_empty() => {
+                        ancestor = parent.to_path_buf();
+                    }
+                    _ => break,
+                }
+            }
+            let mut resolved = ancestor.canonicalize().unwrap_or_else(|_| ancestor.clone());
+            for part in suffix.iter().rev() {
+                resolved.push(part);
+            }
+            normalize_path_lexically(&resolved)
+        }
+    }
+}
+
+/// A caller-supplied value failed an intake validation rule: a declared
+/// workspace root set (or a workspace/cwd that cannot head one) was refused.
+///
+/// The distinct type (not just an `anyhow!` string) lets HTTP lanes classify
+/// the rejection as the caller's mistake — HTTP 400 — instead of a server
+/// fault (review #484/CodeWhale round-22 SF22-4). The `Display` text is the
+/// rejection reason, unchanged from the plain `anyhow!` strings these sites
+/// used before, so message-based classifiers keep working.
+#[derive(Debug)]
+pub struct IntakeValidationError {
+    message: String,
+}
+
+impl std::fmt::Display for IntakeValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for IntakeValidationError {}
+
+impl IntakeValidationError {
+    /// Build the rejection as an `anyhow::Error` so existing `anyhow::Result`
+    /// signatures carry it transparently.
+    fn err(message: impl Into<String>) -> anyhow::Error {
+        anyhow::Error::new(Self {
+            message: message.into(),
+        })
+    }
+}
+
+/// Ceiling on one declared root set (review #484/CodeWhale round-22 SF22-8).
+/// Every boundary consumer scales with the set length — the intake dedup,
+/// per-turn sandbox materialization, per-operand `boundary_roots`
+/// canonicalization, and repo law's per-root constitution loads — so an
+/// unbounded declaration from a hostile or buggy client converts per-turn
+/// work into a permanent stall. 64 is far above any legitimate multi-repo
+/// session and bounds that work to a constant.
+pub const MAX_WORKSPACE_ROOTS: usize = 64;
+
 /// Intake validation for a caller-declared root set: admit it whole or reject
 /// it with an error, never silently reshape it.
 ///
@@ -153,26 +288,33 @@ pub fn validate_workspace_roots(cwd: &Path, roots: &[PathBuf]) -> Result<Vec<Pat
     if cwd.as_os_str().is_empty() || !cwd.is_absolute() {
         return Ok(Vec::new());
     }
+    if roots.len() > MAX_WORKSPACE_ROOTS {
+        return Err(IntakeValidationError::err(format!(
+            "workspace root set declares {} roots; the intake cap is {MAX_WORKSPACE_ROOTS}, \
+             and an oversized declaration stalls every per-turn boundary computation",
+            roots.len()
+        )));
+    }
     let primary = normalize_lexical_components(cwd);
     for root in roots {
         if root.as_os_str().is_empty() || !root.is_absolute() {
-            return Err(anyhow!(
+            return Err(IntakeValidationError::err(format!(
                 "workspace root must be an absolute path; got {root:?}"
-            ));
+            )));
         }
         let normalized = normalize_lexical_components(root);
         if is_filesystem_root(&normalized) {
-            return Err(anyhow!(
+            return Err(IntakeValidationError::err(format!(
                 "workspace root {root:?} normalizes to the filesystem root; \
                  attaching it would make the whole filesystem writable"
-            ));
+            )));
         }
         if primary != normalized && primary.starts_with(&normalized) {
-            return Err(anyhow!(
+            return Err(IntakeValidationError::err(format!(
                 "workspace root {root:?} contains the primary root {cwd:?}; \
                  attaching an ancestor of the primary would widen the sandbox \
                  past the primary"
-            ));
+            )));
         }
     }
     Ok(normalize_workspace_roots(cwd, roots))
@@ -237,7 +379,7 @@ fn resolve_resume_roots(
     if let Some(cwd) = params_cwd
         && cwd.as_os_str().is_empty()
     {
-        return Err(anyhow!("cwd must not be empty"));
+        return Err(IntakeValidationError::err("cwd must not be empty"));
     }
     if let Some(roots) = params_roots {
         let cwd = params_cwd
@@ -944,7 +1086,7 @@ impl ThreadManager {
         if let Some(cwd) = params.cwd.as_ref()
             && cwd.as_os_str().is_empty()
         {
-            return Err(anyhow!("cwd must not be empty"));
+            return Err(IntakeValidationError::err("cwd must not be empty"));
         }
         let parent = self.store.get_thread(&params.thread_id)?;
         let Some(parent) = parent else {
@@ -1323,7 +1465,7 @@ impl Runtime {
                 if let Some(cwd) = params.cwd.as_ref()
                     && cwd.as_os_str().is_empty()
                 {
-                    return Err(anyhow!("cwd must not be empty"));
+                    return Err(IntakeValidationError::err("cwd must not be empty"));
                 }
                 let cwd = params.cwd.clone().unwrap_or_else(|| {
                     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
@@ -1602,7 +1744,17 @@ impl Runtime {
         workspace_roots: &[PathBuf],
     ) -> Result<Value> {
         let fallback_cwd = cwd.display().to_string();
-        let (command, policy_cwd, execution_kind) = call.execution_subject(&fallback_cwd);
+        let (command, raw_policy_cwd, execution_kind) = call.execution_subject(&fallback_cwd);
+        // Judge the same effective cwd execution resolves (review
+        // #484/CodeWhale round-22 B22-5): this lane used to hand the RAW
+        // `params.cwd` operand to the policy check while execution resolved
+        // the same operand roots-aware and canonically — a symlink-spelled
+        // operand evaded a deny scoped to the canonical target, and any
+        // relative/`..` operand made `normalize_workspace_scope` reject the
+        // judgment side, silently disarming every scoped rule for the call.
+        let policy_cwd = resolve_operand_cwd(cwd, &raw_policy_cwd)
+            .to_string_lossy()
+            .into_owned();
         let policy_tool = match &call.payload {
             ToolPayload::LocalShell { .. } => "exec_shell",
             _ => call.name.as_str(),
@@ -1617,8 +1769,12 @@ impl Runtime {
             sandbox_mode: None,
             // The caller supplies the session's root set (hint map on the
             // app-server bridge); an empty slice keeps the byte-identical
-            // single-root posture for callers that have none.
-            workspace_roots: workspace_roots.to_vec(),
+            // single-root posture for callers that have none. The declared
+            // set is the only roots intake with no validator in front of it,
+            // so it at least goes through the shape normalizer the engine
+            // lane applies — empty/relative entries dropped, primary
+            // prepended, deduped — instead of reaching the policy raw.
+            workspace_roots: normalize_workspace_roots(cwd, workspace_roots),
         })?;
         let precheck = policy_precheck_payload(&decision, &command, &policy_cwd, execution_kind);
         let response_id = format!("tool-{}", Uuid::new_v4());
@@ -4463,5 +4619,226 @@ mod tests {
             history.is_empty(),
             "a refused message must leave no history rows: {history:?}"
         );
+    }
+
+    /// Round-22 B22-5: the headless `/tool` + stdio tool-call lane must judge
+    /// exec policy on the same resolved effective cwd execution uses.
+    fn local_shell_call(command: &str, cwd: Option<&str>) -> ToolCall {
+        ToolCall {
+            name: "shell".to_string(),
+            payload: ToolPayload::LocalShell {
+                params: codewhale_protocol::LocalShellParams {
+                    command: command.to_string(),
+                    cwd: cwd.map(str::to_string),
+                    timeout_ms: None,
+                },
+            },
+            source: ToolCallSource::Direct,
+            raw_tool_call_id: None,
+        }
+    }
+
+    fn runtime_with_exec_rules(rules: Vec<codewhale_execpolicy::ToolAskRule>) -> Runtime {
+        Runtime::new(
+            ConfigToml::default(),
+            ModelRegistry::default(),
+            temp_core_state("invoke-tool-judged-cwd"),
+            Arc::new(ToolRegistry::default()),
+            Arc::new(McpManager::default()),
+            ExecPolicyEngine::with_rulesets(vec![
+                codewhale_execpolicy::Ruleset::user(vec![], vec![]).with_ask_rules(rules),
+            ]),
+            HookDispatcher::default(),
+        )
+    }
+
+    fn exec_deny_scoped_to(workspace: &Path) -> codewhale_execpolicy::ToolAskRule {
+        codewhale_execpolicy::ToolAskRule {
+            tool: "exec_shell".into(),
+            command: Some("git push".into()),
+            command_exact: false,
+            path: None,
+            workspace: Some(workspace.to_string_lossy().into_owned()),
+            action: codewhale_execpolicy::PermissionAction::Deny,
+        }
+    }
+
+    #[tokio::test]
+    async fn invoke_tool_judges_a_relative_operand_cwd_like_execution() {
+        // The raw relative operand made `normalize_workspace_scope` reject
+        // the judgment side, so every scope matched against the judged cwd
+        // was silently inert for the call — including a deny scoped to the
+        // very directory execution lands in. The deny here is scoped to the
+        // subdirectory the operands resolve to (it is deliberately NOT in
+        // the declared root set, so the root-set spanning cannot mask the
+        // judged-cwd leg).
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = temp.path().join("ws");
+        std::fs::create_dir_all(workspace.join("sub/x")).expect("fixture dirs");
+        let workspace_canonical = workspace.canonicalize().expect("canonical workspace");
+        let sub_canonical = workspace.join("sub").canonicalize().expect("canonical sub");
+
+        let runtime = runtime_with_exec_rules(vec![exec_deny_scoped_to(&sub_canonical)]);
+
+        for operand in ["sub/.", "./sub", "sub/x/.."] {
+            let result = runtime
+                .invoke_tool(
+                    local_shell_call("git push origin main", Some(operand)),
+                    AskForApproval::OnRequest,
+                    &workspace_canonical,
+                    // Single-root posture: an empty declared set.
+                    &[],
+                )
+                .await
+                .expect("invoke tool");
+            assert_eq!(
+                result["status"], "denied",
+                "operand {operand:?} resolves into the denied subdirectory, so the deny \
+                 must fire instead of every scoped rule being inert: {result}"
+            );
+        }
+
+        // Control: an operand resolving outside the denied scope keeps the
+        // ordinary approval gate — the deny is exact, not blanket.
+        let result = runtime
+            .invoke_tool(
+                local_shell_call(
+                    "git push origin main",
+                    Some(workspace_canonical.to_string_lossy().as_ref()),
+                ),
+                AskForApproval::OnRequest,
+                &workspace_canonical,
+                &[],
+            )
+            .await
+            .expect("invoke tool");
+        assert_eq!(result["status"], "approval_required", "{result}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn invoke_tool_judges_a_symlink_spelled_operand_like_execution() {
+        // A deny scoped to the canonical spelling of the directory execution
+        // lands in was evaded by a symlink-spelled operand: judgment compared
+        // the raw lexical spelling while execution canonicalized through the
+        // link. The denied scope is deliberately absent from the declared
+        // root set so the root-set spanning cannot mask the judged-cwd leg.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = temp.path().join("ws");
+        let real = temp.path().join("real");
+        std::fs::create_dir_all(&workspace).expect("workspace dir");
+        std::fs::create_dir_all(&real).expect("real dir");
+        let real_canonical = real.canonicalize().expect("canonical real");
+        std::os::unix::fs::symlink(&real_canonical, workspace.join("link")).expect("symlink");
+
+        let runtime = runtime_with_exec_rules(vec![exec_deny_scoped_to(&real_canonical)]);
+        let link = workspace.join("link");
+        let result = runtime
+            .invoke_tool(
+                local_shell_call(
+                    "git push origin main",
+                    Some(link.to_string_lossy().as_ref()),
+                ),
+                AskForApproval::OnRequest,
+                &workspace.canonicalize().expect("canonical workspace"),
+                &[],
+            )
+            .await
+            .expect("invoke tool");
+        assert_eq!(
+            result["status"], "denied",
+            "the symlink resolves into the denied root, so the deny must fire: {result}"
+        );
+    }
+
+    #[test]
+    fn normalize_path_lexically_clamps_and_keeps_like_the_tool_boundary() {
+        // The shared normalizer behind the tools boundary's landing
+        // normalize: an overshoot `..` clamps at the filesystem root; a `..`
+        // a relative spelling cannot pop is kept.
+        assert_eq!(
+            normalize_path_lexically(Path::new("/w/x/../../../att/vendor/lib.rs")),
+            PathBuf::from("/att/vendor/lib.rs")
+        );
+        assert_eq!(
+            normalize_path_lexically(Path::new("/a/..")),
+            PathBuf::from("/")
+        );
+        assert_eq!(
+            normalize_path_lexically(Path::new("a/../../b")),
+            PathBuf::from("../b")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_operand_cwd_walks_symlinks_like_execution() {
+        // Existing operands canonicalize through the link; a nonexistent
+        // operand resolves through the deepest existing ancestor and
+        // re-appends the popped tail — the walk the engine's judged-cwd
+        // applies (round-20 B20-1 / round-21 B21-3), now shared.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let ws = temp.path().join("ws");
+        let attached = temp.path().join("att/repo");
+        std::fs::create_dir_all(&ws).expect("ws");
+        std::fs::create_dir_all(&attached).expect("attached");
+        std::os::unix::fs::symlink(&attached, ws.join("link")).expect("symlink");
+        let ws_canonical = ws.canonicalize().expect("canonical ws");
+        let attached_canonical = attached.canonicalize().expect("canonical attached");
+
+        assert_eq!(
+            resolve_operand_cwd(&ws_canonical, "link"),
+            attached_canonical,
+            "an existing operand canonicalizes through the symlink"
+        );
+        assert_eq!(
+            resolve_operand_cwd(&ws_canonical, "link/absent"),
+            attached_canonical.join("absent"),
+            "a nonexistent tail resolves through the deepest existing ancestor"
+        );
+        assert_eq!(
+            resolve_operand_cwd(&ws_canonical, "link/absent/../.."),
+            attached_canonical.join("absent"),
+            "`..` is not a Normal component, so `file_name` skips it and the walk \
+             keeps the last named segment — the engine lane's exact behavior, \
+             moved verbatim"
+        );
+    }
+
+    #[test]
+    fn validate_workspace_roots_caps_the_declared_set_size() {
+        // Round-22 SF22-8: every boundary consumer scales with the set
+        // length, so an oversized declaration must be refused at intake
+        // rather than stalling every turn.
+        let cwd = PathBuf::from("/repo");
+        let root = |i: usize| PathBuf::from(format!("/att{i}"));
+        let at_cap: Vec<PathBuf> = (0..MAX_WORKSPACE_ROOTS).map(root).collect();
+        assert!(validate_workspace_roots(&cwd, &at_cap).is_ok());
+        let over_cap: Vec<PathBuf> = (0..=MAX_WORKSPACE_ROOTS).map(root).collect();
+        let err = validate_workspace_roots(&cwd, &over_cap).expect_err("over-cap must reject");
+        assert!(
+            err.downcast_ref::<IntakeValidationError>().is_some(),
+            "the cap is an intake rejection: {err}"
+        );
+    }
+
+    #[test]
+    fn intake_rejections_carry_the_typed_validation_error() {
+        // The distinct type is what lets HTTP lanes answer 400 instead of a
+        // server-fault 500 (SF22-4); the Display text is unchanged.
+        let cwd = PathBuf::from("/repo");
+        for roots in [
+            vec![PathBuf::from("relative/dir")],
+            vec![PathBuf::from("/..")],
+            vec![cwd.parent().expect("repo parent").to_path_buf()],
+        ] {
+            let err =
+                validate_workspace_roots(&cwd, &roots).expect_err("intake rejection expected");
+            assert!(
+                err.downcast_ref::<IntakeValidationError>().is_some(),
+                "rejection for {roots:?} must be typed: {err}"
+            );
+        }
+        assert!(validate_workspace_roots(&cwd, &[PathBuf::from("/shared")]).is_ok());
     }
 }

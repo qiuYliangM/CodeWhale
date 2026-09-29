@@ -5128,6 +5128,102 @@ fn restore_snapshot_endpoint_helper_rejects_unknown_snapshot_id() -> Result<()> 
 }
 
 #[tokio::test]
+async fn restore_route_names_the_attached_roots_boundary_for_multi_root_threads() -> Result<()> {
+    // Round-22 B22-4: the restore face reported a bare `{"restored": id}`
+    // while every sibling rollback face carried the attached-roots clause.
+    // The snapshot's `[sid=...]` tag joins it to the owning thread record,
+    // whose declared root set decides whether the clause is added.
+    let _lock = lock_test_env();
+    let root = tempfile::tempdir()?;
+    let home = root.path().join("home");
+    fs::create_dir_all(&home)?;
+    let _home = EnvVarGuard::set("HOME", &home);
+
+    let sessions_dir = root.path().join("sessions");
+    let workspace = root.path().join("workspace");
+    let Some((addr, runtime_threads, handle)) = spawn_test_server_with_root_token_mobile_workspace(
+        root.path().to_path_buf(),
+        sessions_dir,
+        None,
+        false,
+        workspace.clone(),
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    let multi = runtime_threads
+        .create_thread(CreateThreadRequest {
+            workspace: Some(workspace.clone()),
+            workspace_roots: vec![root.path().join("attached")],
+            ..CreateThreadRequest::default()
+        })
+        .await?;
+    runtime_threads
+        .set_thread_session_id(&multi.id, "sess-multi")
+        .await?;
+    let single = runtime_threads
+        .create_thread(CreateThreadRequest {
+            workspace: Some(workspace.clone()),
+            ..CreateThreadRequest::default()
+        })
+        .await?;
+    runtime_threads
+        .set_thread_session_id(&single.id, "sess-single")
+        .await?;
+
+    let repo = crate::snapshot::SnapshotRepo::open_or_init(&workspace)?;
+    fs::write(workspace.join("a.txt"), "v1")?;
+    let multi_snap = repo.snapshot_with_session("pre-turn:1", Some("sess-multi"))?;
+    fs::write(workspace.join("a.txt"), "v2")?;
+    let single_snap = repo.snapshot_with_session("pre-turn:2", Some("sess-single"))?;
+    fs::write(workspace.join("a.txt"), "v3")?;
+
+    // Multi-root: the clause names what the restore does NOT revert.
+    let response = client
+        .post(format!(
+            "http://{addr}/v1/snapshots/{}/restore",
+            multi_snap.0
+        ))
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await?;
+    assert_eq!(body["restored"], multi_snap.0.as_str());
+    assert_eq!(
+        body["boundary"]["attached_roots_not_reverted"],
+        json!(true),
+        "a disjoint attached root persists past the restore: {body}"
+    );
+    assert!(
+        body["boundary"]["note"]
+            .as_str()
+            .is_some_and(|note| note.contains("attached workspace roots")),
+        "{body}"
+    );
+
+    // Single-root: the legacy response shape stays byte-identical.
+    let response = client
+        .post(format!(
+            "http://{addr}/v1/snapshots/{}/restore",
+            single_snap.0
+        ))
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await?;
+    assert!(
+        body.get("boundary").is_none(),
+        "a single-root restore must not grow the clause: {body}"
+    );
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn session_create_from_thread_rejects_active_turn() -> Result<()> {
     let Some((addr, runtime_threads, handle)) = spawn_test_server().await? else {
         return Ok(());
@@ -5447,10 +5543,7 @@ async fn session_patch_route_renames_archives_and_reports_real_changes() -> Resu
     Ok(())
 }
 
-/// A session the TUI holds open is refused with a typed 409 rather than
-/// written behind its back./// `PUT /v1/sessions` against a session the TUI holds open is refused with a
-/// typed 409 before any write, so a stale engine snapshot cannot erase the
-/// live owner's non-empty workspace root set (the PUT/autosave flip-flop)./// `?peek=true` returns the bounded redacted projection, and the plain route
+/// `?peek=true` returns the bounded redacted projection, and the plain route
 /// still returns the full detail shape.
 #[tokio::test]
 async fn session_detail_route_serves_a_bounded_redacted_peek_on_request() -> Result<()> {

@@ -391,12 +391,11 @@ fn file_write_target_paths(tool_name: &str, input: &Value) -> Option<Vec<String>
         "write_file" | "edit_file" => vec![
             // Raw spelling, untrimmed: the carve-out must judge exactly the
             // path execution resolves (`ToolContext::resolve_path` joins the
-            // raw string onto the workspace).
-            input
-                .get("path")
-                .and_then(Value::as_str)
-                .filter(|path| !path.is_empty())
-                .map(str::to_string)?,
+            // raw string onto the workspace). Alias spellings
+            // (`file_path`/`filePath`) included: execution folds them onto
+            // `path` only at execute time, so reading `path` alone judged
+            // nothing for an alias-spelled write (round-22 B22-2).
+            crate::tools::file::path_param_value(input)?,
         ],
         "apply_patch" => {
             crate::tools::apply_patch::preflight_apply_patch(input)
@@ -1141,6 +1140,35 @@ mod tests {
             &[],
         );
         assert!(!ctx.write_targets_bounded);
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn filePath_spelled_write_reaches_the_auto_review_carve_out() {
+        // Round-22 B22-2: execution folds the camelCase `filePath` alias onto
+        // `path` only at execute time, so Auto-Review's target collector read
+        // `path` alone and an alias-spelled write had no bounded targets —
+        // an unbounded write reached review. The alias must extract the same
+        // target.
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let attached = tempfile::tempdir().expect("attached root tempdir");
+        std::fs::create_dir(workspace.path().join(".git")).expect("git marker");
+        std::fs::create_dir(attached.path().join(".git")).expect("git marker");
+        let target = attached.path().join("src/a.rs");
+
+        let ctx = AutoReviewContext::from_tool_call(
+            "write_file",
+            &json!({ "filePath": target.to_string_lossy() }),
+            RunOrigin::Interactive,
+            ApprovalMode::Auto,
+            true,
+            Some(workspace.path()),
+            &[attached.path().to_path_buf()],
+        );
+        assert!(
+            ctx.write_targets_bounded,
+            "a filePath-spelled write under an attached git root must be judged"
+        );
     }
 
     #[test]

@@ -5871,13 +5871,45 @@ async fn restore_snapshot(
     State(state): State<RuntimeApiState>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    restore_snapshot_for_workspace(&state.workspace, &id)?;
-    Ok(Json(json!({
-        "restored": id,
-    })))
+    let snapshot = restore_snapshot_for_workspace(&state.workspace, &id)?;
+    let mut payload = json!({ "restored": id });
+    // Snapshots are primary-bound: with attached roots in the owning
+    // thread's set, name the rollback boundary instead of implying a full
+    // revert (review #484/CodeWhale round-22 B22-4 — this face reported a
+    // bare `{"restored": id}` while every sibling rollback face carried the
+    // clause). The snapshot's `[sid=...]` tag names the session that took
+    // it; the bound thread record carries the declared root set. An
+    // untagged (legacy) snapshot has no thread to consult, so the response
+    // stays unchanged rather than guessing.
+    if let Some(session_id) = snapshot.session_id.as_deref() {
+        let threads = state
+            .runtime_threads
+            .list_threads(ThreadListFilter::IncludeArchived, None)
+            .await
+            .map_err(|e| ApiError::internal(format!("Failed to list threads: {e}")))?;
+        let boundary = threads
+            .iter()
+            .filter(|thread| thread.session_id.as_deref() == Some(session_id))
+            .any(|thread| {
+                crate::snapshot::restore_covers_primary_only(
+                    &thread.workspace,
+                    &thread.workspace_roots,
+                )
+            });
+        if boundary {
+            payload["boundary"] = json!({
+                "attached_roots_not_reverted": true,
+                "note": crate::snapshot::ATTACHED_ROOTS_NOT_REVERTED_NOTE,
+            });
+        }
+    }
+    Ok(Json(payload))
 }
 
-fn restore_snapshot_for_workspace(workspace: &FsPath, id: &str) -> Result<(), ApiError> {
+fn restore_snapshot_for_workspace(
+    workspace: &FsPath,
+    id: &str,
+) -> Result<crate::snapshot::Snapshot, ApiError> {
     let repo = crate::snapshot::SnapshotRepo::open_or_init(workspace)
         .map_err(|e| ApiError::internal(format!("Snapshot repo init failed: {e}")))?;
     // The id arrives from the request path and is handed to git as a
@@ -5887,18 +5919,18 @@ fn restore_snapshot_for_workspace(workspace: &FsPath, id: &str) -> Result<(), Ap
     // for command-line-injection scanners (an allowlist `contains` is
     // their modeled trust boundary), so the pre-existing, accepted flow
     // stops re-flagging when call sites are refactored.
-    let known_ids: Vec<String> = repo
+    let known = repo
         .list(usize::MAX)
-        .map_err(|e| ApiError::internal(format!("Failed to list snapshots: {e}")))?
-        .into_iter()
-        .map(|snapshot| snapshot.id.as_str().to_string())
-        .collect();
-    if !known_ids.contains(&id.to_string()) {
-        return Err(ApiError::not_found(format!("no such snapshot: {id}")));
-    }
+        .map_err(|e| ApiError::internal(format!("Failed to list snapshots: {e}")))?;
+    let snapshot = known
+        .iter()
+        .find(|snapshot| snapshot.id.as_str() == id)
+        .ok_or_else(|| ApiError::not_found(format!("no such snapshot: {id}")))?;
+    let snapshot = snapshot.clone();
     let snapshot_id = crate::snapshot::SnapshotId(id.to_string());
     repo.restore(&snapshot_id)
-        .map_err(|e| ApiError::internal(format!("Snapshot restore failed: {e}")))
+        .map_err(|e| ApiError::internal(format!("Snapshot restore failed: {e}")))?;
+    Ok(snapshot)
 }
 
 fn snapshot_entries_for_workspace(

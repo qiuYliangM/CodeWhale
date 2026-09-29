@@ -204,16 +204,19 @@ fn is_not_archived(archived: &bool) -> bool {
 
 /// Sessions currently owned by an in-process interactive surface (the TUI).
 ///
-/// A saved session is a file, and a running TUI holds the authoritative copy
-/// in memory: it autosaves the whole document from `App` state. That makes an
-/// out-of-band write to the *same* session unsafe — the next autosave would
-/// silently revert it. Rather than let that happen quietly, the owner claims
-/// the id here and any external writer is refused.
+/// The registry's remaining consumer is the orphan-reclamation keep-chain:
+/// a running TUI holds the authoritative session copy in memory and re-saves
+/// the whole document, so the directory `reclaim_orphaned_session_dirs`
+/// sweeps must never treat a live owner's session as an orphan. (The
+/// write-conflict guard this registry used to feed was retired — round-20
+/// B20-3: the process-local External lane never coexists with the
+/// interactive surface in a shipped topology, so external writes converge
+/// by last-write-wins at the store layer.)
 ///
 /// A static registry rather than a field on `RuntimeApiState` because the
 /// embedded Runtime API runs inside the TUI process; a standalone
-/// `codewhale web` has an empty registry and is therefore never blocked, which
-/// is exactly right — there is no TUI holding anything.
+/// `codewhale web` has an empty registry, and the reclaim sweep needs no
+/// entries there — a headless process holds no interactive autosave.
 static LIVE_SESSIONS: std::sync::OnceLock<std::sync::RwLock<std::collections::HashSet<String>>> =
     std::sync::OnceLock::new();
 
@@ -292,9 +295,11 @@ pub fn is_claimed_session_dir(session_id: &str) -> bool {
 
 /// Who is asking to mutate a saved session.
 ///
-/// This is an authority distinction, not a convenience one: the owner may
-/// write because it will update its in-memory copy in the same step; anyone
-/// else may not, because it cannot.
+/// This was an authority distinction when a live owner's out-of-band write
+/// could revert the next autosave; since the live guard's retirement
+/// (round-20 B20-3) both spellings write, so the parameter is retained only
+/// in the API shape. The owner distinction still documents intent: the owner
+/// updates its cached copy atomically with the write, anyone else cannot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionMutator {
     /// The in-process surface that currently owns the session (the TUI). It
@@ -302,7 +307,7 @@ pub enum SessionMutator {
     /// write — see `App::apply_session_mutation`.
     Owner,
     /// Any other writer: the Runtime API, the web dashboard, a second
-    /// process. Refused while the session is claimed.
+    /// process. Writes converge by last-write-wins at the store layer.
     External,
 }
 
@@ -310,7 +315,8 @@ pub enum SessionMutator {
 ///
 /// The TUI owns at most one session at a time, so switching sessions must
 /// release the previous claim in the same step — otherwise a `/new` would
-/// leave the old id permanently locked against the dashboard.
+/// leave the old id in the registry and the orphan-reclamation sweep would
+/// keep a directory no interactive surface is using.
 pub fn set_live_session(session_id: Option<&str>) {
     // Recover a poisoned write lock rather than dropping the claim: a lost
     // claim unblocks external writers against a session that may still
@@ -348,11 +354,10 @@ fn is_session_uuid(name: &str) -> bool {
 ///
 /// The query is judged against the trimmed id, the same normalized value
 /// `set_live_session` stores: every store path trims (`validated_session_id`),
-/// so an exact match on the raw string would let a padded id (`" sess-… "`)
-/// slip past the live-session conflict and overwrite the live owner's
-/// document. A poisoned lock means ownership cannot be determined, so the
-/// answer fails closed: treat the session as live and make external writers
-/// take the conflict, rather than race an autosave nobody can see.
+/// so the keep-chain compares one canonical value. A poisoned lock means
+/// ownership cannot be determined, so the answer fails closed: treat the
+/// session as live and keep its directory out of the orphan sweep, rather
+/// than reclaim a directory an autosave nobody can see is still writing.
 #[must_use]
 pub fn is_live_session(session_id: &str) -> bool {
     let trimmed = session_id.trim();

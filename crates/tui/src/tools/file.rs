@@ -238,6 +238,29 @@ pub(super) fn apply_param_aliases(
     Ok(())
 }
 
+/// Read the canonical `path` parameter with every accepted alias spelling,
+/// in `apply_param_aliases` fold order: the canonical key wins, then the
+/// aliases in declaration order, empty strings skipped.
+///
+/// Plan-time gates — repo law, persisted ask/allow/deny rules, the
+/// in-workspace write carve-out, Auto-Review — run before execution folds
+/// `PATH_ALIASES` onto `path` (the default `ToolSpec::prepare` passes input
+/// through unchanged), so each must consult this helper instead of reading
+/// `path` alone: a `file_path`- or `filePath`-spelled write was otherwise
+/// invisible to every one of them at once (review #484/CodeWhale round-22
+/// B22-2).
+pub(crate) fn path_param_value(input: &Value) -> Option<String> {
+    std::iter::once("path")
+        .chain(PATH_ALIASES.iter().map(|alias| alias.alias))
+        .find_map(|key| {
+            input
+                .get(key)
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+}
+
 // === Per-action parameter contracts ===
 
 /// The parameter contract for one `File` action.

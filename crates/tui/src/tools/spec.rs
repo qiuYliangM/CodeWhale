@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 
@@ -1356,48 +1356,13 @@ pub async fn lsp_diagnostics_for_paths(context: &ToolContext, paths: &[PathBuf])
     render_blocks(&blocks)
 }
 
+/// The tools boundary's landing normalizer: clamps a `..` at the filesystem
+/// root, keeps a `..` a relative spelling cannot pop. Delegates to the shared
+/// core implementation so the judgment lanes (repo law, the judged exec cwd)
+/// normalize identically by construction instead of by copy
+/// (review #484/CodeWhale round-22 B22-5).
 pub(crate) fn normalize_path(path: &Path) -> PathBuf {
-    let mut prefix: Option<std::ffi::OsString> = None;
-    let mut is_root = false;
-    let mut stack: Vec<std::ffi::OsString> = Vec::new();
-
-    for component in path.components() {
-        match component {
-            Component::Prefix(prefix_component) => {
-                prefix = Some(prefix_component.as_os_str().to_owned());
-            }
-            Component::RootDir => {
-                is_root = true;
-            }
-            Component::CurDir => {}
-            Component::ParentDir => {
-                let parent = Component::ParentDir.as_os_str();
-                if let Some(last) = stack.pop() {
-                    if last == parent {
-                        stack.push(last);
-                        stack.push(parent.to_owned());
-                    }
-                } else if !is_root {
-                    stack.push(parent.to_owned());
-                }
-            }
-            Component::Normal(part) => {
-                stack.push(part.to_owned());
-            }
-        }
-    }
-
-    let mut normalized = PathBuf::new();
-    if let Some(prefix) = prefix {
-        normalized.push(prefix);
-    }
-    if is_root {
-        normalized.push(Path::new(std::path::MAIN_SEPARATOR_STR));
-    }
-    for part in stack {
-        normalized.push(part);
-    }
-    normalized
+    codewhale_core::normalize_path_lexically(path)
 }
 
 /// The core trait that all tools must implement.

@@ -695,24 +695,43 @@ async fn thread_handler(State(state): State<AppState>, Json(req): Json<ThreadReq
             }
             (StatusCode::OK, Json(res)).into_response()
         }
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ThreadResponse {
-                thread_id: "error".to_string(),
-                status: format!("error:{err}"),
-                thread: None,
-                threads: Vec::new(),
-                goal: None,
-                model: None,
-                model_provider: None,
-                cwd: None,
-                approval_policy: None,
-                sandbox: None,
-                events: Vec::new(),
-                data: json!({}),
-            }),
-        )
-            .into_response(),
+        Err(err) => {
+            // Intake-validation rejections are the caller's mistake, not a
+            // server fault: a declared root set that fails
+            // `validate_workspace_roots` (or an empty explicit cwd) answers
+            // 400 with the reason, where the unconditional 500 misclassified
+            // a client error and leaked absolute paths through a `status`
+            // field (review #484/CodeWhale round-22 SF22-4). The stdio
+            // lane's -32603 mapping is disclosed and stays.
+            if err
+                .downcast_ref::<codewhale_core::IntakeValidationError>()
+                .is_some()
+            {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": err.to_string() })),
+                )
+                    .into_response();
+            }
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ThreadResponse {
+                    thread_id: "error".to_string(),
+                    status: format!("error:{err}"),
+                    thread: None,
+                    threads: Vec::new(),
+                    goal: None,
+                    model: None,
+                    model_provider: None,
+                    cwd: None,
+                    approval_policy: None,
+                    sandbox: None,
+                    events: Vec::new(),
+                    data: json!({}),
+                }),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -3473,6 +3492,40 @@ mod tests {
             hint.workspace_roots,
             vec![workspace.clone(), tmp.path().join("attached")],
             "the attached root set survives — a wipe here is what collapses the next turn to single-root"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_thread_face_answers_400_on_intake_validation_errors() {
+        // Round-22 SF22-4: a caller-side intake rejection (here, an explicit
+        // empty cwd; the same class as a declared root set failing
+        // `validate_workspace_roots`) is the client's mistake and answers
+        // 400 with the reason — the unconditional 500 misclassified it as a
+        // server fault and carried the paths in a `status` field. The stdio
+        // lane keeps its disclosed -32603 mapping.
+        let (app, _tmp) = app_with_config(None);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/thread")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({ "kind": "start", "cwd": "" }))
+                            .expect("request json"),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response_body_json(response).await;
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|message| message.contains("cwd must not be empty")),
+            "the rejection reason must be in the body: {body}"
         );
     }
 

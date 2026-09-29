@@ -116,7 +116,7 @@ pub(crate) fn repo_law_plan_decision(
 }
 
 /// Extract workspace-relative write targets from a tool input. Covers the
-/// `path`/`target`/`destination`/`file_path` params, canonical
+/// `path`/`filePath`/`target`/`destination`/`file_path` params, canonical
 /// `replace[].path`, legacy `changes[].path`, and
 /// every unified-diff / codex-envelope header shape the patch tools accept —
 /// old (`--- `) and new (`+++ `) paths, with or without an `a/`/`b/` prefix,
@@ -134,7 +134,12 @@ fn write_target_paths(
     input: &Value,
 ) -> Vec<String> {
     let mut targets = Vec::new();
-    for key in ["path", "target", "destination", "file_path"] {
+    // `filePath` is the camelCase spelling `PATH_ALIASES` folds onto `path`
+    // at execute time (`tools/file.rs`); the default `ToolSpec::prepare`
+    // passes input through unchanged, so plan-time judgment must scan it
+    // too — a `filePath`-spelled write otherwise gets zero repo-law targets
+    // and no constitution ever fires (round-22 B22-2).
+    for key in ["path", "filePath", "target", "destination", "file_path"] {
         if let Some(path) = input.get(key).and_then(Value::as_str) {
             push_normalized(&mut targets, workspace, root, root_canonical, path);
         }
@@ -280,7 +285,7 @@ fn push_normalized(
     // raw string with component operations — splitting display strings is not
     // a path operation and silently misparses Windows separators.
     let raw_path = Path::new(raw);
-    let candidate = if raw_path.is_absolute() {
+    let raw_joined = if raw_path.is_absolute() {
         raw_path.to_path_buf()
     } else {
         workspace.join(raw_path)
@@ -289,7 +294,7 @@ fn push_normalized(
     // execution, so an overshoot spelling still yields the landing path the
     // write tools would admit — judging it is what closes the overshoot
     // bypass into an attached root.
-    let candidate = normalize_lexical_components(&candidate);
+    let candidate = normalize_lexical_components(&raw_joined);
     if let Ok(tail) = candidate
         .strip_prefix(root)
         .or_else(|_| candidate.strip_prefix(root_canonical))
@@ -304,6 +309,23 @@ fn push_normalized(
     // symlink hop into this root (or a root reached through one) cannot
     // spell its way past the law.
     if let Some(resolved) = crate::core::authority::resolve_deepest_existing(&candidate)
+        && let Ok(tail) = resolved.strip_prefix(root_canonical)
+    {
+        let tail = tail.to_string_lossy().replace('\\', "/");
+        if !tail.is_empty() {
+            targets.push(tail);
+        }
+    }
+    // Then symlink reality on the PRE-normalization candidate: the lexical
+    // normalize above collapses `l/..` BEFORE the resolved leg runs, so a
+    // symlink+`..` hop (`/p/l/../secret` with `/p/l → /shared/x`) judged the
+    // collapsed `/p/secret` while execution's canonicalize expands the link
+    // FIRST and only then applies `..` — landing in `/shared/secret`. The
+    // attached root's constitution never saw the target (round-22 B22-1).
+    // Resolving the raw joined candidate walks the same symlink-expanded
+    // reality execution walks; the already-normalized leg above stays so
+    // the overshoot-clamp behavior is judged both ways.
+    if let Some(resolved) = crate::core::authority::resolve_deepest_existing(&raw_joined)
         && let Ok(tail) = resolved.strip_prefix(root_canonical)
     {
         let tail = tail.to_string_lossy().replace('\\', "/");
@@ -965,5 +987,62 @@ mod tests {
             );
         };
         assert!(reason.contains("Sub tree is read-only"), "{reason}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_dotdot_hop_into_an_attached_root_is_held() {
+        // Round-22 B22-1: the kernel applies `..` AFTER symlink expansion, so
+        // `/p/l/../secret` with `/p/l → /shared/x` executes in
+        // `/shared/secret` — but the lexical normalize collapsed `l/..` FIRST
+        // and the resolved leg ran on that collapsed spelling, so the
+        // attached root's constitution judged `/p/secret` and never fired.
+        // Under Full Access the write landed in a constitution-protected path
+        // with no hold at all (at base it was PathEscape-blocked).
+        let primary = TempDir::new().unwrap();
+        let attached = TempDir::new().unwrap();
+        write_law(
+            attached.path(),
+            r#"{"protected_invariants": [
+                { "text": "secret is read-only", "paths": ["secret"], "action": "block" }
+            ]}"#,
+        );
+        std::fs::create_dir(attached.path().join("x")).unwrap();
+        std::fs::create_dir(attached.path().join("secret")).unwrap();
+        std::os::unix::fs::symlink(attached.path().join("x"), primary.path().join("l"))
+            .expect("symlink");
+
+        let spelling = format!("{}/l/../secret", primary.path().display());
+        let decision = repo_law_plan_decision(
+            primary.path(),
+            &[attached.path().to_path_buf()],
+            "write_file",
+            &json!({"path": spelling, "content": "x"}),
+        );
+        let Some(RepoLawPlanDecision::Block(reason)) = decision else {
+            panic!("expected the attached root's law to hold a symlink+`..` hop, got {decision:?}");
+        };
+        assert!(reason.contains("secret is read-only"), "{reason}");
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn filePath_spelled_write_receives_the_same_hold() {
+        // Round-22 B22-2: execution folds the camelCase `filePath` alias onto
+        // `path` (`PATH_ALIASES`) only at execute time, and the default
+        // `ToolSpec::prepare` passes input through unchanged — so a
+        // `filePath`-spelled write produced zero repo-law targets and no
+        // constitution ever fired.
+        let tmp = TempDir::new().unwrap();
+        write_law(tmp.path(), LAW);
+        let decision = decide(
+            tmp.path(),
+            "write_file",
+            &json!({"filePath": "crates/protocol/wire.rs", "content": "x"}),
+        );
+        let Some(RepoLawPlanDecision::Block(reason)) = decision else {
+            panic!("expected the filePath-spelled write to be held, got {decision:?}");
+        };
+        assert!(reason.contains("The wire format is frozen"), "{reason}");
     }
 }

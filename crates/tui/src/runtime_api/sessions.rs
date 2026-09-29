@@ -198,10 +198,10 @@ pub(super) async fn patch_session(
     Path(id): Path<String>,
     Json(req): Json<PatchSessionRequest>,
 ) -> Result<Json<PatchSessionResponse>, ApiError> {
-    // Normalize the id once at the boundary: the live-session guard and the
-    // store both judge the trimmed value, so a padded id (`"%20sess…"` in
-    // the path) is one session to every check — it cannot read as a stranger
-    // to the guard and as the owner to the store. An empty id has no target.
+    // Normalize the id once at the boundary: the store judges the trimmed
+    // value, so a padded id (`"%20sess…"` in the path) is one session to the
+    // store, not two rows distinguished by whitespace. An empty id has no
+    // target.
     let id = id.trim().to_string();
     if id.is_empty() {
         return Err(ApiError::bad_request(
@@ -731,11 +731,10 @@ pub(super) async fn save_current_session(
     State(state): State<RuntimeApiState>,
     Json(mut req): Json<SaveSessionRequest>,
 ) -> Result<Json<SaveSessionResponse>, ApiError> {
-    // Normalize the id once at the boundary: the live-session guard and the
-    // store both judge the trimmed value, so a padded id (`" sess… "`) is one
-    // session to every check — it cannot read as a stranger to the guard and
-    // as the owner to the store. An explicit-but-empty id has no target at
-    // all and is rejected, not silently turned into "create new".
+    // Normalize the id once at the boundary: the store judges the trimmed
+    // value, so a padded id (`" sess… "`) is one session to the store, not
+    // two rows distinguished by whitespace. An explicit-but-empty id has no
+    // target at all and is rejected, not silently turned into "create new".
     if let Some(raw) = req.session_id.as_deref() {
         let trimmed = raw.trim();
         if trimmed.is_empty() {

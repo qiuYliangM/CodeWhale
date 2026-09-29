@@ -976,15 +976,16 @@ pub(crate) fn build_session_snapshot(
     session.last_auto_route = app.auto_route_for_persistence();
     session.window_title.clone_from(&app.window_title);
     app.current_session_metadata = Some(session.metadata.clone());
-    // Claim ownership of this session for the process. From here on the
-    // Runtime API refuses external renames/archives of it with a typed 409
-    // rather than writing something the next snapshot would revert.
+    // Claim ownership of this session for the process. The registry's
+    // remaining consumer is the orphan-reclamation keep-chain: a live
+    // owner's session directory is never swept while the TUI holds it.
     //
     // Claiming here rather than at each of the ten `current_session_id`
     // assignment sites is deliberate: this is the function that establishes
     // "the TUI holds the authoritative copy", which is exactly the condition
-    // the conflict protects. A session that has never been snapshotted has no
-    // in-memory state to lose, so leaving it unclaimed is correct, not a gap.
+    // the keep-chain protects. A session that has never been snapshotted has
+    // no in-memory state to lose, so leaving it unclaimed is correct, not a
+    // gap.
     crate::session_manager::set_live_session(Some(&session.metadata.id));
     Ok(session)
 }

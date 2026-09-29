@@ -369,36 +369,22 @@ pub(crate) async fn run_exec_agent(
     let mut loaded_session_id = None;
     if let Some(saved) = resume_session {
         let saved_id = saved.metadata.id.clone();
-        if saved.metadata.workspace != workspace {
-            // Round-21 B21-6: the carried additional roots are re-based onto
-            // the new primary here and persisted back on save — the same
-            // row-minting moment the runtime lanes validate. A carried entry
-            // that becomes an ancestor of (or a super-root for) the new
-            // primary fails the resume loudly instead of durably widening the
-            // row behind the moved directory.
-            let carried: Vec<PathBuf> = saved
-                .metadata
-                .workspace_roots
-                .iter()
-                .filter(|root| **root != saved.metadata.workspace)
-                .cloned()
-                .collect();
-            codewhale_core::validate_workspace_roots(&workspace, &carried).map_err(|err| {
-                anyhow::anyhow!(
-                    "Session {} was created in a different workspace ({}); re-anchoring its root set onto {} would widen past it ({err:#}). Resume with the original workspace or re-declare --workspace-roots.",
-                    truncate_id(&saved_id),
-                    saved.metadata.workspace.display(),
-                    workspace.display()
-                )
-            })?;
-            if output_format == ExecOutputFormat::Text {
-                eprintln!(
-                    "Warning: session {} was created in a different workspace ({}). Resuming in {}.",
-                    truncate_id(&saved_id),
-                    saved.metadata.workspace.display(),
-                    workspace.display()
-                );
-            }
+        if saved.metadata.workspace != workspace && output_format == ExecOutputFormat::Text {
+            // The engine runs the SAVED workspace/root pair (the
+            // `Op::SyncSession` below re-normalizes it against itself), so
+            // the CLI `--workspace` does not re-anchor a resumed session and
+            // there is nothing to validate here — the lane never mints a
+            // moved row. The warning only tells the user which directory the
+            // session actually runs in (round-22 SF22-3 retires the round-21
+            // hard block, which refused legitimate resumes against a
+            // workspace the lane never adopts and named a
+            // `--workspace-roots` flag that does not exist).
+            eprintln!(
+                "Warning: session {} was created in a different workspace ({}). \
+                 Resuming in the session's own workspace.",
+                truncate_id(&saved_id),
+                saved.metadata.workspace.display(),
+            );
         }
 
         engine_handle

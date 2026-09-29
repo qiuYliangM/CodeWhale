@@ -9848,6 +9848,62 @@ fn canonical_file_action_honors_legacy_path_ask_rules() {
 }
 
 #[test]
+#[allow(non_snake_case)]
+fn camelCase_file_path_alias_reaches_the_ask_rule_and_carve_out_judgments() {
+    // Round-22 B22-2: execution folds `filePath` (and `file_path`) onto
+    // `path` via `PATH_ALIASES` only at execute time, and the default
+    // `ToolSpec::prepare` passes input through unchanged — so an
+    // alias-spelled write was invisible to the persisted ask-rule judgment
+    // and to the in-workspace write carve-out at once.
+    let config = EngineConfig {
+        exec_policy_engine: file_ask_rule_engine("write_file", "src/lib.rs"),
+        ..EngineConfig::default()
+    };
+
+    let camel = file_tool_ask_rule_decision(
+        &config,
+        "File",
+        &json!({"action": "write", "filePath": "src/lib.rs", "content": "new\n"}),
+        Path::new("/repo"),
+        &[],
+        crate::tui::approval::ApprovalMode::Auto,
+    );
+    assert_eq!(
+        camel,
+        Some(ToolAskRuleDecision::Prompt(
+            "Typed ask rule 'tool=write_file path=src/lib.rs' requires approval.".to_string()
+        )),
+        "a filePath-spelled write must reach the ask-rule judgment"
+    );
+
+    let snake = file_tool_ask_rule_decision(
+        &config,
+        "File",
+        &json!({"action": "write", "file_path": "src/lib.rs", "content": "new\n"}),
+        Path::new("/repo"),
+        &[],
+        crate::tui::approval::ApprovalMode::Auto,
+    );
+    assert_eq!(
+        snake, camel,
+        "the file_path alias must behave identically to filePath"
+    );
+
+    // The canonical key still wins when present, matching the execute-time
+    // fold (both present and disagreeing fails the call at execution, so the
+    // judgment is free to prefer the canonical spelling).
+    let canonical_wins = file_tool_ask_rule_decision(
+        &config,
+        "File",
+        &json!({"action": "write", "path": "src/other.rs", "filePath": "src/lib.rs"}),
+        Path::new("/repo"),
+        &[],
+        crate::tui::approval::ApprovalMode::Auto,
+    );
+    assert_eq!(canonical_wins, None, "path wins; other.rs is not ruled");
+}
+
+#[test]
 fn apply_patch_allow_requires_every_touched_path_to_match() {
     let rules = ["src/a.rs", "src/b.rs"]
         .into_iter()

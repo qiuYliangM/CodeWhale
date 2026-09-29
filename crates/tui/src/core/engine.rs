@@ -8155,52 +8155,14 @@ pub(crate) fn exec_shell_ask_rule_decision_for_policy(
     // the symlink target, firing a primary-scoped allow across the boundary
     // (review #484/CodeWhale round-20 B20-1). A nonexistent operand
     // resolves through the deepest existing ancestor (symlinks included),
-    // matching resolve_nonexistent_path's behavior (round-21 B21-3).
+    // matching resolve_nonexistent_path's behavior (round-21 B21-3). The
+    // walk lives in core (`resolve_operand_cwd`) so the headless
+    // `Runtime::invoke_tool` lane judges the identical effective cwd with
+    // one shared implementation (round-22 B22-5).
     let effective_cwd = ["cwd", "working_dir"]
         .iter()
         .find_map(|name| tool_input.get(name).and_then(Value::as_str))
-        .map(|dir| {
-            let raw = Path::new(dir);
-            let joined = if raw.is_absolute() {
-                raw.to_path_buf()
-            } else {
-                workspace.join(raw)
-            };
-            match joined.canonicalize() {
-                Ok(canonical) => canonical,
-                // Round-21 B21-3: a nonexistent operand mirrors
-                // `resolve_nonexistent_path` — walk LEXICALLY to the deepest
-                // existing ancestor (keeping the popped tail, trailing `..`
-                // included), canonicalize it through any symlink, re-append
-                // the tail and normalize. Keeping the plain lexical join here
-                // recreated the round-20 bypass one layer deeper under
-                // `workspace_follow_symlinks` (`link/<absent>/../..` judged
-                // as the primary while execution landed in the link target).
-                Err(_) => {
-                    let mut ancestor = joined.clone();
-                    let mut suffix: Vec<std::ffi::OsString> = Vec::new();
-                    loop {
-                        if ancestor.exists() {
-                            break;
-                        }
-                        if let Some(name) = ancestor.file_name() {
-                            suffix.push(name.to_owned());
-                        }
-                        match ancestor.parent() {
-                            Some(parent) if !parent.as_os_str().is_empty() => {
-                                ancestor = parent.to_path_buf();
-                            }
-                            _ => break,
-                        }
-                    }
-                    let mut resolved = ancestor.canonicalize().unwrap_or_else(|_| ancestor.clone());
-                    for part in suffix.iter().rev() {
-                        resolved.push(part);
-                    }
-                    crate::tools::spec::normalize_path(&resolved)
-                }
-            }
-        });
+        .map(|dir| codewhale_core::resolve_operand_cwd(workspace, dir));
     tool_ask_rule_decision_for_context(
         exec_policy_engine,
         policy_tool_name,
@@ -8341,12 +8303,18 @@ fn tool_ask_rule_decision_for_context(
 }
 
 fn file_tool_permission_paths(tool_name: &str, input: &Value) -> Option<Vec<String>> {
+    // Alias-aware (`file_path`/`filePath`): the ask-rule and carve-out
+    // judgments run before execution folds `PATH_ALIASES` onto `path`, so
+    // an alias-spelled call was invisible to every persisted rule and to
+    // the write carve-out (round-22 B22-2).
     match tool_name {
-        "read_file" | "write_file" | "edit_file" | "file_search" | "grep_files" => {
-            Some(string_field(input, "path").into_iter().collect())
-        }
+        "read_file" | "write_file" | "edit_file" | "file_search" | "grep_files" => Some(
+            crate::tools::file::path_param_value(input)
+                .into_iter()
+                .collect(),
+        ),
         "list_dir" => Some(vec![
-            string_field(input, "path").unwrap_or_else(|| ".".to_string()),
+            crate::tools::file::path_param_value(input).unwrap_or_else(|| ".".to_string()),
         ]),
         "apply_patch" => Some(apply_patch_permission_paths(input)),
         _ => None,
@@ -8362,14 +8330,6 @@ fn file_write_tool_target_paths(tool_name: &str, input: &Value) -> Option<Vec<St
         return None;
     }
     file_tool_permission_paths(canonical, input)
-}
-
-fn string_field(input: &Value, key: &str) -> Option<String> {
-    input
-        .get(key)
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
 }
 
 fn apply_patch_permission_paths(input: &Value) -> Vec<String> {
