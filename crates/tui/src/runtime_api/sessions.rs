@@ -897,7 +897,13 @@ pub(super) async fn save_current_session(
                         &snapshot.model_provider,
                         snapshot.model_provider_id.as_deref(),
                     );
-                    session.metadata.workspace_roots = snapshot.workspace_roots.clone();
+                    // Round-42 minor 8: the sanitize belt on every mint arm (the update arm
+                    // already runs it — the create/recover arms cloned verbatim).
+                    let (sanitized_roots, _dropped) = codewhale_core::sanitize_workspace_roots(
+                        &snapshot.workspace,
+                        &snapshot.workspace_roots,
+                    );
+                    session.metadata.workspace_roots = sanitized_roots;
                     session
                 } else {
                     return Err(ApiError::internal(format!(
@@ -919,7 +925,13 @@ pub(super) async fn save_current_session(
             &snapshot.model_provider,
             snapshot.model_provider_id.as_deref(),
         );
-        session.metadata.workspace_roots = snapshot.workspace_roots.clone();
+        // Round-42 minor 8: the sanitize belt on every mint arm (the update arm
+        // already runs it — the create/recover arms cloned verbatim).
+        let (sanitized_roots, _dropped) = codewhale_core::sanitize_workspace_roots(
+            &snapshot.workspace,
+            &snapshot.workspace_roots,
+        );
+        session.metadata.workspace_roots = sanitized_roots;
         session
     };
 
